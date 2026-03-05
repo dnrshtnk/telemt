@@ -183,6 +183,31 @@ impl MeFloorMode {
     }
 }
 
+/// Middle-End route behavior when no writer is immediately available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeRouteNoWriterMode {
+    #[default]
+    AsyncRecoveryFailfast,
+    InlineRecoveryLegacy,
+}
+
+impl MeRouteNoWriterMode {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            MeRouteNoWriterMode::AsyncRecoveryFailfast => 0,
+            MeRouteNoWriterMode::InlineRecoveryLegacy => 1,
+        }
+    }
+
+    pub fn from_u8(raw: u8) -> Self {
+        match raw {
+            1 => MeRouteNoWriterMode::InlineRecoveryLegacy,
+            _ => MeRouteNoWriterMode::AsyncRecoveryFailfast,
+        }
+    }
+}
+
 /// Per-user unique source IP limit mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -511,6 +536,10 @@ pub struct GeneralConfig {
     #[serde(default = "default_unknown_dc_log_path")]
     pub unknown_dc_log_path: Option<String>,
 
+    /// Enable unknown-DC file logging.
+    #[serde(default = "default_unknown_dc_file_log_enabled")]
+    pub unknown_dc_file_log_enabled: bool,
+
     #[serde(default)]
     pub log_level: LogLevel,
 
@@ -537,6 +566,22 @@ pub struct GeneralConfig {
     /// Queue occupancy percent threshold for high backpressure timeout.
     #[serde(default = "default_me_route_backpressure_high_watermark_pct")]
     pub me_route_backpressure_high_watermark_pct: u8,
+
+    /// ME route behavior when no writer is immediately available.
+    #[serde(default)]
+    pub me_route_no_writer_mode: MeRouteNoWriterMode,
+
+    /// Maximum wait time in milliseconds for async-recovery failfast mode.
+    #[serde(default = "default_me_route_no_writer_wait_ms")]
+    pub me_route_no_writer_wait_ms: u64,
+
+    /// Number of inline recovery attempts in legacy mode.
+    #[serde(default = "default_me_route_inline_recovery_attempts")]
+    pub me_route_inline_recovery_attempts: u32,
+
+    /// Maximum wait time in milliseconds for inline recovery in legacy mode.
+    #[serde(default = "default_me_route_inline_recovery_wait_ms")]
+    pub me_route_inline_recovery_wait_ms: u64,
 
     /// [general.links] — proxy link generation overrides.
     #[serde(default)]
@@ -719,6 +764,7 @@ impl Default for GeneralConfig {
             upstream_connect_failfast_hard_errors: default_upstream_connect_failfast_hard_errors(),
             stun_iface_mismatch_ignore: false,
             unknown_dc_log_path: default_unknown_dc_log_path(),
+            unknown_dc_file_log_enabled: default_unknown_dc_file_log_enabled(),
             log_level: LogLevel::Normal,
             disable_colors: false,
             telemetry: TelemetryConfig::default(),
@@ -726,6 +772,10 @@ impl Default for GeneralConfig {
             me_route_backpressure_base_timeout_ms: default_me_route_backpressure_base_timeout_ms(),
             me_route_backpressure_high_timeout_ms: default_me_route_backpressure_high_timeout_ms(),
             me_route_backpressure_high_watermark_pct: default_me_route_backpressure_high_watermark_pct(),
+            me_route_no_writer_mode: MeRouteNoWriterMode::default(),
+            me_route_no_writer_wait_ms: default_me_route_no_writer_wait_ms(),
+            me_route_inline_recovery_attempts: default_me_route_inline_recovery_attempts(),
+            me_route_inline_recovery_wait_ms: default_me_route_inline_recovery_wait_ms(),
             links: LinksConfig::default(),
             crypto_pending_buffer: default_crypto_pending_buffer(),
             max_client_frame: default_max_client_frame(),

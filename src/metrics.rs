@@ -1199,6 +1199,48 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
             0
         }
     );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_no_writer_failfast_total ME route failfast errors due to missing writer in bounded wait window"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_no_writer_failfast_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_no_writer_failfast_total {}",
+        if me_allows_normal {
+            stats.get_me_no_writer_failfast_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_async_recovery_trigger_total Async ME recovery trigger attempts from route path"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_async_recovery_trigger_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_async_recovery_trigger_total {}",
+        if me_allows_normal {
+            stats.get_me_async_recovery_trigger_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_inline_recovery_total Legacy inline ME recovery attempts from route path"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_inline_recovery_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_inline_recovery_total {}",
+        if me_allows_normal {
+            stats.get_me_inline_recovery_total()
+        } else {
+            0
+        }
+    );
 
     let unresolved_writer_losses = if me_allows_normal {
         stats
@@ -1237,6 +1279,29 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
     let _ = writeln!(out, "# TYPE telemt_user_msgs_from_client counter");
     let _ = writeln!(out, "# HELP telemt_user_msgs_to_client Per-user messages sent");
     let _ = writeln!(out, "# TYPE telemt_user_msgs_to_client counter");
+    let _ = writeln!(
+        out,
+        "# HELP telemt_ip_reservation_rollback_total IP reservation rollbacks caused by later limit checks"
+    );
+    let _ = writeln!(out, "# TYPE telemt_ip_reservation_rollback_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_ip_reservation_rollback_total{{reason=\"tcp_limit\"}} {}",
+        if core_enabled {
+            stats.get_ip_reservation_rollback_tcp_limit_total()
+        } else {
+            0
+        }
+    );
+    let _ = writeln!(
+        out,
+        "telemt_ip_reservation_rollback_total{{reason=\"quota_limit\"}} {}",
+        if core_enabled {
+            stats.get_ip_reservation_rollback_quota_limit_total()
+        } else {
+            0
+        }
+    );
     let _ = writeln!(
         out,
         "# HELP telemt_telemetry_user_series_suppressed User-labeled metric series suppression flag"

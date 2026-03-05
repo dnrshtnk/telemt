@@ -381,6 +381,22 @@ fn warn_non_hot_changes(old: &ProxyConfig, new: &ProxyConfig, non_hot_changed: b
         warned = true;
         warn!("config reload: general.middle_proxy_pool_size changed; restart required");
     }
+    if old.general.me_route_no_writer_mode != new.general.me_route_no_writer_mode
+        || old.general.me_route_no_writer_wait_ms != new.general.me_route_no_writer_wait_ms
+        || old.general.me_route_inline_recovery_attempts
+            != new.general.me_route_inline_recovery_attempts
+        || old.general.me_route_inline_recovery_wait_ms
+            != new.general.me_route_inline_recovery_wait_ms
+    {
+        warned = true;
+        warn!("config reload: general.me_route_no_writer_* changed; restart required");
+    }
+    if old.general.unknown_dc_log_path != new.general.unknown_dc_log_path
+        || old.general.unknown_dc_file_log_enabled != new.general.unknown_dc_file_log_enabled
+    {
+        warned = true;
+        warn!("config reload: general.unknown_dc_* changed; restart required");
+    }
     if old.general.me_init_retry_attempts != new.general.me_init_retry_attempts {
         warned = true;
         warn!("config reload: general.me_init_retry_attempts changed; restart required");

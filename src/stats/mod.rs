@@ -100,6 +100,11 @@ pub struct Stats {
     me_refill_failed_total: AtomicU64,
     me_writer_restored_same_endpoint_total: AtomicU64,
     me_writer_restored_fallback_total: AtomicU64,
+    me_no_writer_failfast_total: AtomicU64,
+    me_async_recovery_trigger_total: AtomicU64,
+    me_inline_recovery_total: AtomicU64,
+    ip_reservation_rollback_tcp_limit_total: AtomicU64,
+    ip_reservation_rollback_quota_limit_total: AtomicU64,
     telemetry_core_enabled: AtomicBool,
     telemetry_user_enabled: AtomicBool,
     telemetry_me_level: AtomicU8,
@@ -522,6 +527,34 @@ impl Stats {
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
+    pub fn increment_me_no_writer_failfast_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_no_writer_failfast_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_async_recovery_trigger_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_async_recovery_trigger_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_inline_recovery_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_inline_recovery_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_ip_reservation_rollback_tcp_limit_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.ip_reservation_rollback_tcp_limit_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_ip_reservation_rollback_quota_limit_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.ip_reservation_rollback_quota_limit_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     pub fn increment_me_endpoint_quarantine_total(&self) {
         if self.telemetry_me_allows_normal() {
             self.me_endpoint_quarantine_total
@@ -790,6 +823,23 @@ impl Stats {
     }
     pub fn get_me_writer_restored_fallback_total(&self) -> u64 {
         self.me_writer_restored_fallback_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_no_writer_failfast_total(&self) -> u64 {
+        self.me_no_writer_failfast_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_async_recovery_trigger_total(&self) -> u64 {
+        self.me_async_recovery_trigger_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_inline_recovery_total(&self) -> u64 {
+        self.me_inline_recovery_total.load(Ordering::Relaxed)
+    }
+    pub fn get_ip_reservation_rollback_tcp_limit_total(&self) -> u64 {
+        self.ip_reservation_rollback_tcp_limit_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_ip_reservation_rollback_quota_limit_total(&self) -> u64 {
+        self.ip_reservation_rollback_quota_limit_total
+            .load(Ordering::Relaxed)
     }
     
     pub fn increment_user_connects(&self, user: &str) {

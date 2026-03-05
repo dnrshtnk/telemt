@@ -7,7 +7,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, Notify, RwLock, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use crate::config::{MeBindStaleMode, MeFloorMode, MeSocksKdfPolicy};
+use crate::config::{MeBindStaleMode, MeFloorMode, MeRouteNoWriterMode, MeSocksKdfPolicy};
 use crate::crypto::SecureRandom;
 use crate::network::IpFamily;
 use crate::network::probe::NetworkDecision;
@@ -145,6 +145,10 @@ pub struct MePool {
     pub(super) secret_atomic_snapshot: AtomicBool,
     pub(super) me_deterministic_writer_sort: AtomicBool,
     pub(super) me_socks_kdf_policy: AtomicU8,
+    pub(super) me_route_no_writer_mode: AtomicU8,
+    pub(super) me_route_no_writer_wait: Duration,
+    pub(super) me_route_inline_recovery_attempts: u32,
+    pub(super) me_route_inline_recovery_wait: Duration,
     pool_size: usize,
 }
 
@@ -227,6 +231,10 @@ impl MePool {
         me_route_backpressure_base_timeout_ms: u64,
         me_route_backpressure_high_timeout_ms: u64,
         me_route_backpressure_high_watermark_pct: u8,
+        me_route_no_writer_mode: MeRouteNoWriterMode,
+        me_route_no_writer_wait_ms: u64,
+        me_route_inline_recovery_attempts: u32,
+        me_route_inline_recovery_wait_ms: u64,
     ) -> Arc<Self> {
         let registry = Arc::new(ConnRegistry::new());
         registry.update_route_backpressure_policy(
@@ -343,6 +351,10 @@ impl MePool {
             secret_atomic_snapshot: AtomicBool::new(me_secret_atomic_snapshot),
             me_deterministic_writer_sort: AtomicBool::new(me_deterministic_writer_sort),
             me_socks_kdf_policy: AtomicU8::new(me_socks_kdf_policy.as_u8()),
+            me_route_no_writer_mode: AtomicU8::new(me_route_no_writer_mode.as_u8()),
+            me_route_no_writer_wait: Duration::from_millis(me_route_no_writer_wait_ms),
+            me_route_inline_recovery_attempts,
+            me_route_inline_recovery_wait: Duration::from_millis(me_route_inline_recovery_wait_ms),
         })
     }
 

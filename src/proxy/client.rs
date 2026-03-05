@@ -672,42 +672,16 @@ impl RunningClientHandler {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let user = &success.user;
+        let user = success.user.clone();
 
-        if let Err(e) = Self::check_user_limits_static(user, &config, &stats, peer_addr, &ip_tracker).await {
+        if let Err(e) = Self::check_user_limits_static(&user, &config, &stats, peer_addr, &ip_tracker).await {
             warn!(user = %user, error = %e, "User limit exceeded");
             return Err(e);
         }
 
-        // IP Cleanup Guard: автоматически удаляет IP при выходе из scope
-        struct IpCleanupGuard {
-            tracker: Arc<UserIpTracker>,
-            user: String,
-            ip: std::net::IpAddr,
-        }
-        
-        impl Drop for IpCleanupGuard {
-            fn drop(&mut self) {
-                let tracker = self.tracker.clone();
-                let user = self.user.clone();
-                let ip = self.ip;
-                tokio::spawn(async move {
-                    tracker.remove_ip(&user, ip).await;
-                    debug!(user = %user, ip = %ip, "IP cleaned up on disconnect");
-                });
-            }
-        }
-        
-        let _cleanup = IpCleanupGuard {
-            tracker: ip_tracker,
-            user: user.clone(),
-            ip: peer_addr.ip(),
-        };
-
-        // Decide: middle proxy or direct
-        if config.general.use_middle_proxy {
+        let relay_result = if config.general.use_middle_proxy {
             if let Some(ref pool) = me_pool {
-                return handle_via_middle_proxy(
+                handle_via_middle_proxy(
                     client_reader,
                     client_writer,
                     success,
@@ -718,23 +692,38 @@ impl RunningClientHandler {
                     local_addr,
                     rng,
                 )
-                .await;
+                .await
+            } else {
+                warn!("use_middle_proxy=true but MePool not initialized, falling back to direct");
+                handle_via_direct(
+                    client_reader,
+                    client_writer,
+                    success,
+                    upstream_manager,
+                    stats,
+                    config,
+                    buffer_pool,
+                    rng,
+                )
+                .await
             }
-            warn!("use_middle_proxy=true but MePool not initialized, falling back to direct");
-        }
+        } else {
+            // Direct mode (original behavior)
+            handle_via_direct(
+                client_reader,
+                client_writer,
+                success,
+                upstream_manager,
+                stats,
+                config,
+                buffer_pool,
+                rng,
+            )
+            .await
+        };
 
-        // Direct mode (original behavior)
-        handle_via_direct(
-            client_reader,
-            client_writer,
-            success,
-            upstream_manager,
-            stats,
-            config,
-            buffer_pool,
-            rng,
-        )
-        .await
+        ip_tracker.remove_ip(&user, peer_addr.ip()).await;
+        relay_result
     }
 
     async fn check_user_limits_static(
@@ -752,22 +741,32 @@ impl RunningClientHandler {
             });
         }
 
+        let mut ip_reserved = false;
         // IP limit check
-        if let Err(reason) = ip_tracker.check_and_add(user, peer_addr.ip()).await {
-            warn!(
-                user = %user,
-                ip = %peer_addr.ip(),
-                reason = %reason,
-                "IP limit exceeded"
-            );
-            return Err(ProxyError::ConnectionLimitExceeded {
-                user: user.to_string(),
-            });
+        match ip_tracker.check_and_add(user, peer_addr.ip()).await {
+            Ok(()) => {
+                ip_reserved = true;
+            }
+            Err(reason) => {
+                warn!(
+                    user = %user,
+                    ip = %peer_addr.ip(),
+                    reason = %reason,
+                    "IP limit exceeded"
+                );
+                return Err(ProxyError::ConnectionLimitExceeded {
+                    user: user.to_string(),
+                });
+            }
         }
 
         if let Some(limit) = config.access.user_max_tcp_conns.get(user)
             && stats.get_user_curr_connects(user) >= *limit as u64
         {
+            if ip_reserved {
+                ip_tracker.remove_ip(user, peer_addr.ip()).await;
+                stats.increment_ip_reservation_rollback_tcp_limit_total();
+            }
             return Err(ProxyError::ConnectionLimitExceeded {
                 user: user.to_string(),
             });
@@ -776,6 +775,10 @@ impl RunningClientHandler {
         if let Some(quota) = config.access.user_data_quota.get(user)
             && stats.get_user_total_octets(user) >= *quota
         {
+            if ip_reserved {
+                ip_tracker.remove_ip(user, peer_addr.ip()).await;
+                stats.increment_ip_reservation_rollback_quota_limit_total();
+            }
             return Err(ProxyError::DataQuotaExceeded {
                 user: user.to_string(),
             });

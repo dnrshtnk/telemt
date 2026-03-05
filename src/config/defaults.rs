@@ -129,6 +129,10 @@ pub(crate) fn default_unknown_dc_log_path() -> Option<String> {
     Some("unknown-dc.txt".to_string())
 }
 
+pub(crate) fn default_unknown_dc_file_log_enabled() -> bool {
+    false
+}
+
 pub(crate) fn default_pool_size() -> usize {
     8
 }
@@ -271,6 +275,18 @@ pub(crate) fn default_me_route_backpressure_high_timeout_ms() -> u64 {
 
 pub(crate) fn default_me_route_backpressure_high_watermark_pct() -> u8 {
     80
+}
+
+pub(crate) fn default_me_route_no_writer_wait_ms() -> u64 {
+    250
+}
+
+pub(crate) fn default_me_route_inline_recovery_attempts() -> u32 {
+    3
+}
+
+pub(crate) fn default_me_route_inline_recovery_wait_ms() -> u64 {
+    3000
 }
 
 pub(crate) fn default_beobachten_minutes() -> u64 {

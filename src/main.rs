@@ -617,6 +617,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 config.general.me_route_backpressure_base_timeout_ms,
                 config.general.me_route_backpressure_high_timeout_ms,
                 config.general.me_route_backpressure_high_watermark_pct,
+                config.general.me_route_no_writer_mode,
+                config.general.me_route_no_writer_wait_ms,
+                config.general.me_route_inline_recovery_attempts,
+                config.general.me_route_inline_recovery_wait_ms,
             );
 
             match pool.init(pool_size, &rng).await {

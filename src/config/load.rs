@@ -410,6 +410,24 @@ impl ProxyConfig {
             ));
         }
 
+        if !(10..=5000).contains(&config.general.me_route_no_writer_wait_ms) {
+            return Err(ProxyError::Config(
+                "general.me_route_no_writer_wait_ms must be within [10, 5000]".to_string(),
+            ));
+        }
+
+        if config.general.me_route_inline_recovery_attempts == 0 {
+            return Err(ProxyError::Config(
+                "general.me_route_inline_recovery_attempts must be > 0".to_string(),
+            ));
+        }
+
+        if !(10..=30000).contains(&config.general.me_route_inline_recovery_wait_ms) {
+            return Err(ProxyError::Config(
+                "general.me_route_inline_recovery_wait_ms must be within [10, 30000]".to_string(),
+            ));
+        }
+
         if config.server.api.request_body_limit_bytes == 0 {
             return Err(ProxyError::Config(
                 "server.api.request_body_limit_bytes must be > 0".to_string(),
@@ -1204,6 +1222,49 @@ mod tests {
         let cfg_valid = ProxyConfig::load(&path_valid).unwrap();
         assert_eq!(cfg_valid.general.rpc_proxy_req_every, 40);
         let _ = std::fs::remove_file(path_valid);
+    }
+
+    #[test]
+    fn me_route_no_writer_wait_ms_out_of_range_is_rejected() {
+        let toml = r#"
+            [general]
+            me_route_no_writer_wait_ms = 5
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_me_route_no_writer_wait_ms_out_of_range_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let err = ProxyConfig::load(&path).unwrap_err().to_string();
+        assert!(err.contains("general.me_route_no_writer_wait_ms must be within [10, 5000]"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn me_route_no_writer_mode_is_parsed() {
+        let toml = r#"
+            [general]
+            me_route_no_writer_mode = "inline_recovery_legacy"
+
+            [censorship]
+            tls_domain = "example.com"
+
+            [access.users]
+            user = "00000000000000000000000000000000"
+        "#;
+        let dir = std::env::temp_dir();
+        let path = dir.join("telemt_me_route_no_writer_mode_parse_test.toml");
+        std::fs::write(&path, toml).unwrap();
+        let cfg = ProxyConfig::load(&path).unwrap();
+        assert_eq!(
+            cfg.general.me_route_no_writer_mode,
+            crate::config::MeRouteNoWriterMode::InlineRecoveryLegacy
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
