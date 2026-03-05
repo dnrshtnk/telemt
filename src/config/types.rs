@@ -187,9 +187,10 @@ impl MeFloorMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MeRouteNoWriterMode {
-    #[default]
     AsyncRecoveryFailfast,
     InlineRecoveryLegacy,
+    #[default]
+    HybridAsyncPersistent,
 }
 
 impl MeRouteNoWriterMode {
@@ -197,13 +198,16 @@ impl MeRouteNoWriterMode {
         match self {
             MeRouteNoWriterMode::AsyncRecoveryFailfast => 0,
             MeRouteNoWriterMode::InlineRecoveryLegacy => 1,
+            MeRouteNoWriterMode::HybridAsyncPersistent => 2,
         }
     }
 
     pub fn from_u8(raw: u8) -> Self {
         match raw {
+            0 => MeRouteNoWriterMode::AsyncRecoveryFailfast,
             1 => MeRouteNoWriterMode::InlineRecoveryLegacy,
-            _ => MeRouteNoWriterMode::AsyncRecoveryFailfast,
+            2 => MeRouteNoWriterMode::HybridAsyncPersistent,
+            _ => MeRouteNoWriterMode::HybridAsyncPersistent,
         }
     }
 }

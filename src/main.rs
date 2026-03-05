@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use rand::Rng;
 use tokio::net::TcpListener;
 use tokio::signal;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc, watch};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt, prelude::*, reload};
 #[cfg(unix)]
@@ -239,6 +239,17 @@ fn format_uptime(total_secs: u64) -> String {
     ));
 
     format!("{} / {} seconds", parts.join(", "), total_secs)
+}
+
+async fn wait_until_admission_open(admission_rx: &mut watch::Receiver<bool>) -> bool {
+    loop {
+        if *admission_rx.borrow() {
+            return true;
+        }
+        if admission_rx.changed().await.is_err() {
+            return *admission_rx.borrow();
+        }
+    }
 }
 
 async fn load_startup_proxy_config_snapshot(
@@ -1325,6 +1336,60 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         print_proxy_links(&host, port, &config);
     }
 
+    let (admission_tx, admission_rx) = watch::channel(true);
+    if config.general.use_middle_proxy {
+        if let Some(pool) = me_pool.as_ref() {
+            let initial_open = pool.admission_ready_full_floor().await;
+            admission_tx.send_replace(initial_open);
+            if initial_open {
+                info!("Conditional-admission gate: open (ME pool ready)");
+            } else {
+                warn!("Conditional-admission gate: closed (ME pool is not ready)");
+            }
+
+            let pool_for_gate = pool.clone();
+            let admission_tx_gate = admission_tx.clone();
+            tokio::spawn(async move {
+                let mut gate_open = initial_open;
+                let mut open_streak = if initial_open { 1u32 } else { 0u32 };
+                let mut close_streak = if initial_open { 0u32 } else { 1u32 };
+                loop {
+                    let ready = pool_for_gate.admission_ready_full_floor().await;
+                    if ready {
+                        open_streak = open_streak.saturating_add(1);
+                        close_streak = 0;
+                        if !gate_open && open_streak >= 2 {
+                            gate_open = true;
+                            admission_tx_gate.send_replace(true);
+                            info!(
+                                open_streak,
+                                "Conditional-admission gate opened (ME pool recovered)"
+                            );
+                        }
+                    } else {
+                        close_streak = close_streak.saturating_add(1);
+                        open_streak = 0;
+                        if gate_open && close_streak >= 2 {
+                            gate_open = false;
+                            admission_tx_gate.send_replace(false);
+                            warn!(
+                                close_streak,
+                                "Conditional-admission gate closed (ME pool below required floor)"
+                            );
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+            });
+        } else {
+            admission_tx.send_replace(false);
+            warn!("Conditional-admission gate: closed (ME pool is unavailable)");
+        }
+    } else {
+        admission_tx.send_replace(true);
+    }
+    let _admission_tx_hold = admission_tx;
+
     // Unix socket setup (before listeners check so unix-only config works)
     let mut has_unix_listener = false;
     #[cfg(unix)]
@@ -1358,6 +1423,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         has_unix_listener = true;
 
         let mut config_rx_unix: tokio::sync::watch::Receiver<Arc<ProxyConfig>> = config_rx.clone();
+        let mut admission_rx_unix = admission_rx.clone();
         let stats = stats.clone();
         let upstream_manager = upstream_manager.clone();
         let replay_checker = replay_checker.clone();
@@ -1373,6 +1439,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             let unix_conn_counter = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(1));
 
             loop {
+                if !wait_until_admission_open(&mut admission_rx_unix).await {
+                    warn!("Conditional-admission gate channel closed for unix listener");
+                    break;
+                }
                 match unix_listener.accept().await {
                     Ok((stream, _)) => {
                         let permit = match max_connections_unix.clone().acquire_owned().await {
@@ -1507,6 +1577,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     for (listener, listener_proxy_protocol) in listeners {
         let mut config_rx: tokio::sync::watch::Receiver<Arc<ProxyConfig>> = config_rx.clone();
+        let mut admission_rx_tcp = admission_rx.clone();
         let stats = stats.clone();
         let upstream_manager = upstream_manager.clone();
         let replay_checker = replay_checker.clone();
@@ -1520,6 +1591,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
         tokio::spawn(async move {
             loop {
+                if !wait_until_admission_open(&mut admission_rx_tcp).await {
+                    warn!("Conditional-admission gate channel closed for tcp listener");
+                    break;
+                }
                 match listener.accept().await {
                     Ok((stream, peer_addr)) => {
                         let permit = match max_connections_tcp.clone().acquire_owned().await {

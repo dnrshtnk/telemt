@@ -22,6 +22,7 @@ use super::registry::ConnMeta;
 
 const IDLE_WRITER_PENALTY_MID_SECS: u64 = 45;
 const IDLE_WRITER_PENALTY_HIGH_SECS: u64 = 55;
+const HYBRID_GLOBAL_BURST_PERIOD_ROUNDS: u32 = 4;
 
 impl MePool {
     /// Send RPC_PROXY_REQ. `tag_override`: per-user ad_tag (from access.user_ad_tags); if None, uses pool default.
@@ -55,6 +56,9 @@ impl MePool {
         let mut no_writer_deadline: Option<Instant> = None;
         let mut emergency_attempts = 0u32;
         let mut async_recovery_triggered = false;
+        let mut hybrid_recovery_round = 0u32;
+        let mut hybrid_last_recovery_at: Option<Instant> = None;
+        let hybrid_wait_step = self.me_route_no_writer_wait.max(Duration::from_millis(50));
 
         loop {
             if let Some(current) = self.registry.get_writer(conn_id).await {
@@ -138,6 +142,18 @@ impl MePool {
                             }
                             continue;
                         }
+                        MeRouteNoWriterMode::HybridAsyncPersistent => {
+                            self.maybe_trigger_hybrid_recovery(
+                                target_dc,
+                                &mut hybrid_recovery_round,
+                                &mut hybrid_last_recovery_at,
+                                hybrid_wait_step,
+                            )
+                            .await;
+                            let deadline = Instant::now() + hybrid_wait_step;
+                            let _ = self.wait_for_writer_until(deadline).await;
+                            continue;
+                        }
                     }
                 }
                 ws.clone()
@@ -214,6 +230,18 @@ impl MePool {
                         if candidate_indices.is_empty() {
                             return Err(ProxyError::Proxy("No ME writers available for target DC".into()));
                         }
+                    }
+                    MeRouteNoWriterMode::HybridAsyncPersistent => {
+                        self.maybe_trigger_hybrid_recovery(
+                            target_dc,
+                            &mut hybrid_recovery_round,
+                            &mut hybrid_last_recovery_at,
+                            hybrid_wait_step,
+                        )
+                        .await;
+                        let deadline = Instant::now() + hybrid_wait_step;
+                        let _ = self.wait_for_candidate_until(target_dc, deadline).await;
+                        continue;
                     }
                 }
             }
@@ -457,6 +485,28 @@ impl MePool {
         }
 
         preferred
+    }
+
+    async fn maybe_trigger_hybrid_recovery(
+        self: &Arc<Self>,
+        target_dc: i16,
+        hybrid_recovery_round: &mut u32,
+        hybrid_last_recovery_at: &mut Option<Instant>,
+        hybrid_wait_step: Duration,
+    ) {
+        if let Some(last) = *hybrid_last_recovery_at
+            && last.elapsed() < hybrid_wait_step
+        {
+            return;
+        }
+
+        let round = *hybrid_recovery_round;
+        let target_triggered = self.trigger_async_recovery_for_target_dc(target_dc).await;
+        if !target_triggered || round % HYBRID_GLOBAL_BURST_PERIOD_ROUNDS == 0 {
+            self.trigger_async_recovery_global().await;
+        }
+        *hybrid_recovery_round = round.saturating_add(1);
+        *hybrid_last_recovery_at = Some(Instant::now());
     }
 
     pub async fn send_close(self: &Arc<Self>, conn_id: u64) -> Result<()> {

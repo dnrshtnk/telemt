@@ -100,6 +100,72 @@ pub(crate) struct MeApiRuntimeSnapshot {
 }
 
 impl MePool {
+    pub(crate) async fn admission_ready_full_floor(&self) -> bool {
+        let mut endpoints_by_dc = BTreeMap::<i16, BTreeSet<SocketAddr>>::new();
+        if self.decision.ipv4_me {
+            let map = self.proxy_map_v4.read().await.clone();
+            for (dc, addrs) in map {
+                let abs_dc = dc.abs();
+                if abs_dc == 0 {
+                    continue;
+                }
+                let Ok(dc_idx) = i16::try_from(abs_dc) else {
+                    continue;
+                };
+                let entry = endpoints_by_dc.entry(dc_idx).or_default();
+                for (ip, port) in addrs {
+                    entry.insert(SocketAddr::new(ip, port));
+                }
+            }
+        }
+        if self.decision.ipv6_me {
+            let map = self.proxy_map_v6.read().await.clone();
+            for (dc, addrs) in map {
+                let abs_dc = dc.abs();
+                if abs_dc == 0 {
+                    continue;
+                }
+                let Ok(dc_idx) = i16::try_from(abs_dc) else {
+                    continue;
+                };
+                let entry = endpoints_by_dc.entry(dc_idx).or_default();
+                for (ip, port) in addrs {
+                    entry.insert(SocketAddr::new(ip, port));
+                }
+            }
+        }
+
+        if endpoints_by_dc.is_empty() {
+            return false;
+        }
+
+        let writers = self.writers.read().await.clone();
+        let mut live_writers_by_endpoint = HashMap::<SocketAddr, usize>::new();
+        for writer in writers {
+            if writer.draining.load(Ordering::Relaxed) {
+                continue;
+            }
+            *live_writers_by_endpoint.entry(writer.addr).or_insert(0) += 1;
+        }
+
+        for endpoints in endpoints_by_dc.values() {
+            let endpoint_count = endpoints.len();
+            if endpoint_count == 0 {
+                return false;
+            }
+            let required = self.required_writers_for_dc_with_floor_mode(endpoint_count, false);
+            let alive: usize = endpoints
+                .iter()
+                .map(|endpoint| live_writers_by_endpoint.get(endpoint).copied().unwrap_or(0))
+                .sum();
+            if alive < required {
+                return false;
+            }
+        }
+
+        true
+    }
+
     pub(crate) async fn api_status_snapshot(&self) -> MeApiStatusSnapshot {
         let now_epoch_secs = Self::now_epoch_secs();
 
