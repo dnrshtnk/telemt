@@ -555,11 +555,6 @@ impl ProxyConfig {
             warn!("prefer_ipv6 is deprecated, use [network].prefer = 6");
         }
 
-        // Auto-enable NAT probe when Middle Proxy is requested.
-        if config.general.use_middle_proxy && !config.general.middle_proxy_nat_probe {
-            config.general.middle_proxy_nat_probe = true;
-            warn!("Auto-enabled middle_proxy_nat_probe for middle proxy mode");
-        }
         if config.general.use_middle_proxy && !config.general.me_secret_atomic_snapshot {
             config.general.me_secret_atomic_snapshot = true;
             warn!(
