@@ -35,7 +35,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = vec![0u8; MASK_BUFFER_SIZE];
+    let mut buf = [0u8; MASK_BUFFER_SIZE];
     loop {
         let read_res = timeout(MASK_RELAY_IDLE_TIMEOUT, reader.read(&mut buf)).await;
         let n = match read_res {

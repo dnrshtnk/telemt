@@ -1,4 +1,5 @@
-use std::collections::hash_map::DefaultHasher;
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -41,6 +42,7 @@ const C2ME_SENDER_FAIRNESS_BUDGET: usize = 32;
 const ME_D2C_FLUSH_BATCH_MAX_FRAMES_MIN: usize = 1;
 const ME_D2C_FLUSH_BATCH_MAX_BYTES_MIN: usize = 4096;
 static DESYNC_DEDUP: OnceLock<DashMap<u64, Instant>> = OnceLock::new();
+static DESYNC_HASHER: OnceLock<RandomState> = OnceLock::new();
 
 struct RelayForensicsState {
     trace_id: u64,
@@ -80,7 +82,8 @@ impl MeD2cFlushPolicy {
 }
 
 fn hash_value<T: Hash>(value: &T) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let state = DESYNC_HASHER.get_or_init(RandomState::new);
+    let mut hasher = state.build_hasher();
     value.hash(&mut hasher);
     hasher.finish()
 }
@@ -106,12 +109,17 @@ fn should_emit_full_desync(key: u64, all_full: bool, now: Instant) -> bool {
 
     if dedup.len() >= DESYNC_DEDUP_MAX_ENTRIES {
         let mut stale_keys = Vec::new();
-        let mut eviction_candidate = None;
+        let mut oldest_candidate: Option<(u64, Instant)> = None;
         for entry in dedup.iter().take(DESYNC_DEDUP_PRUNE_SCAN_LIMIT) {
-            if eviction_candidate.is_none() {
-                eviction_candidate = Some(*entry.key());
+            let key = *entry.key();
+            let seen_at = *entry.value();
+
+            match oldest_candidate {
+                Some((_, oldest_seen)) if seen_at >= oldest_seen => {}
+                _ => oldest_candidate = Some((key, seen_at)),
             }
-            if now.duration_since(*entry.value()) >= DESYNC_DEDUP_WINDOW {
+
+            if now.duration_since(seen_at) >= DESYNC_DEDUP_WINDOW {
                 stale_keys.push(*entry.key());
             }
         }
@@ -119,7 +127,7 @@ fn should_emit_full_desync(key: u64, all_full: bool, now: Instant) -> bool {
             dedup.remove(&stale_key);
         }
         if dedup.len() >= DESYNC_DEDUP_MAX_ENTRIES {
-            let Some(evict_key) = eviction_candidate else {
+            let Some((evict_key, _)) = oldest_candidate else {
                 return false;
             };
             dedup.remove(&evict_key);

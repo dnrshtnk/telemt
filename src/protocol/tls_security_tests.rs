@@ -731,6 +731,246 @@ fn replay_window_cap_still_allows_small_boot_timestamp() {
     );
 }
 
+#[test]
+fn ignore_time_skew_explicitly_decouples_from_boot_time_cap() {
+    let secret = b"ignore_skew_boot_cap_decouple_test";
+    let ts: u32 = 1;
+    let h = make_valid_tls_handshake(secret, ts);
+    let secrets = vec![("u".to_string(), secret.to_vec())];
+
+    let cap_zero = validate_tls_handshake_at_time_with_boot_cap(&h, &secrets, true, 0, 0);
+    let cap_nonzero =
+        validate_tls_handshake_at_time_with_boot_cap(&h, &secrets, true, 0, BOOT_TIME_MAX_SECS);
+
+    assert!(cap_zero.is_some(), "ignore_time_skew=true must accept valid HMAC");
+    assert!(
+        cap_nonzero.is_some(),
+        "ignore_time_skew path must not depend on boot-time cap"
+    );
+
+    let a = cap_zero.unwrap();
+    let b = cap_nonzero.unwrap();
+    assert_eq!(a.user, b.user);
+    assert_eq!(a.timestamp, b.timestamp);
+}
+
+#[test]
+fn adversarial_small_boot_timestamp_matrix_rejected_when_boot_cap_forced_zero() {
+    let secret = b"boot_cap_zero_matrix_test";
+    let secrets = vec![("u".to_string(), secret.to_vec())];
+    let now: i64 = 1_700_000_000;
+
+    for ts in 0u32..1024u32 {
+        let h = make_valid_tls_handshake(secret, ts);
+        let result = validate_tls_handshake_at_time_with_boot_cap(&h, &secrets, false, now, 0);
+        assert!(
+            result.is_none(),
+            "boot cap=0 must reject timestamp {ts} when skew checks are active"
+        );
+    }
+}
+
+#[test]
+fn light_fuzz_boot_cap_zero_rejects_small_timestamp_space() {
+    let secret = b"boot_cap_zero_fuzz_test";
+    let secrets = vec![("u".to_string(), secret.to_vec())];
+    let now: i64 = 1_700_000_000;
+    let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+
+    for _ in 0..4096 {
+        s ^= s << 7;
+        s ^= s >> 9;
+        s ^= s << 8;
+        let ts = (s as u32) % 2048;
+
+        let h = make_valid_tls_handshake(secret, ts);
+        let result = validate_tls_handshake_at_time_with_boot_cap(&h, &secrets, false, now, 0);
+        assert!(
+            result.is_none(),
+            "fuzzed boot-range timestamp {ts} must be rejected when cap=0"
+        );
+    }
+}
+
+#[test]
+fn stress_boot_cap_zero_rejection_is_deterministic_under_high_iteration_count() {
+    let secret = b"boot_cap_zero_stress_test";
+    let secrets = vec![("u".to_string(), secret.to_vec())];
+    let now: i64 = 1_700_000_000;
+
+    for i in 0u32..20_000u32 {
+        let ts = i % 4096;
+        let h = make_valid_tls_handshake(secret, ts);
+        let result = validate_tls_handshake_at_time_with_boot_cap(&h, &secrets, false, now, 0);
+        assert!(
+            result.is_none(),
+            "iteration {i}: timestamp {ts} must be rejected with cap=0"
+        );
+    }
+}
+
+#[test]
+fn replay_window_one_allows_only_zero_timestamp_boot_bypass() {
+    let secret = b"replay_window_one_boot_test";
+    let secrets = vec![("u".to_string(), secret.to_vec())];
+
+    let ts0 = make_valid_tls_handshake(secret, 0);
+    let ts1 = make_valid_tls_handshake(secret, 1);
+
+    assert!(
+        validate_tls_handshake_with_replay_window(&ts0, &secrets, false, 1).is_some(),
+        "replay_window=1 must allow timestamp 0 via boot-time compatibility"
+    );
+    assert!(
+        validate_tls_handshake_with_replay_window(&ts1, &secrets, false, 1).is_none(),
+        "replay_window=1 must reject timestamp 1 on normal wall-clock systems"
+    );
+}
+
+#[test]
+fn replay_window_two_allows_ts0_ts1_but_rejects_ts2() {
+    let secret = b"replay_window_two_boot_test";
+    let secrets = vec![("u".to_string(), secret.to_vec())];
+
+    let ts0 = make_valid_tls_handshake(secret, 0);
+    let ts1 = make_valid_tls_handshake(secret, 1);
+    let ts2 = make_valid_tls_handshake(secret, 2);
+
+    assert!(validate_tls_handshake_with_replay_window(&ts0, &secrets, false, 2).is_some());
+    assert!(validate_tls_handshake_with_replay_window(&ts1, &secrets, false, 2).is_some());
+    assert!(
+        validate_tls_handshake_with_replay_window(&ts2, &secrets, false, 2).is_none(),
+        "timestamp equal to replay-window cap must not use boot-time bypass"
+    );
+}
+
+#[test]
+fn adversarial_skew_boundary_matrix_accepts_only_inclusive_window_when_boot_disabled() {
+    let secret = b"skew_boundary_matrix_test";
+    let secrets = vec![("u".to_string(), secret.to_vec())];
+    let now: i64 = 1_700_000_000;
+
+    for offset in -1500i64..=1500i64 {
+        let ts_i64 = now - offset;
+        let ts = u32::try_from(ts_i64).expect("timestamp must fit u32 for test matrix");
+        let h = make_valid_tls_handshake(secret, ts);
+        let accepted = validate_tls_handshake_at_time_with_boot_cap(&h, &secrets, false, now, 0)
+            .is_some();
+        let expected = (TIME_SKEW_MIN..=TIME_SKEW_MAX).contains(&offset);
+        assert_eq!(
+            accepted, expected,
+            "offset {offset} must match inclusive skew window when boot bypass is disabled"
+        );
+    }
+}
+
+#[test]
+fn light_fuzz_skew_window_rejects_outside_range_when_boot_disabled() {
+    let secret = b"skew_outside_fuzz_test";
+    let secrets = vec![("u".to_string(), secret.to_vec())];
+    let now: i64 = 1_700_000_000;
+    let mut s: u64 = 0x0123_4567_89AB_CDEF;
+
+    for _ in 0..4096 {
+        s ^= s << 7;
+        s ^= s >> 9;
+        s ^= s << 8;
+
+        let magnitude = 1300i64 + ((s % 2000u64) as i64);
+        let sign = if (s & 1) == 0 { 1i64 } else { -1i64 };
+        let offset = sign * magnitude;
+        let ts_i64 = now - offset;
+        let ts = u32::try_from(ts_i64).expect("timestamp must fit u32 for fuzz test");
+
+        let h = make_valid_tls_handshake(secret, ts);
+        let accepted = validate_tls_handshake_at_time_with_boot_cap(&h, &secrets, false, now, 0)
+            .is_some();
+        assert!(
+            !accepted,
+            "offset {offset} must be rejected outside strict skew window"
+        );
+    }
+}
+
+#[test]
+fn stress_boot_disabled_validation_matches_time_diff_oracle() {
+    let secret = b"boot_disabled_oracle_stress_test";
+    let secrets = vec![("u".to_string(), secret.to_vec())];
+    let now: i64 = 1_700_000_000;
+    let mut s: u64 = 0xBADC_0FFE_EE11_2233;
+
+    for _ in 0..25_000 {
+        s ^= s << 7;
+        s ^= s >> 9;
+        s ^= s << 8;
+        let ts = s as u32;
+        let h = make_valid_tls_handshake(secret, ts);
+
+        let accepted = validate_tls_handshake_at_time_with_boot_cap(&h, &secrets, false, now, 0)
+            .is_some();
+        let time_diff = now - i64::from(ts);
+        let expected = (TIME_SKEW_MIN..=TIME_SKEW_MAX).contains(&time_diff);
+        assert_eq!(
+            accepted, expected,
+            "boot-disabled validation must match pure time-diff oracle"
+        );
+    }
+}
+
+#[test]
+fn integration_large_user_list_with_boot_disabled_finds_only_matching_user() {
+    let now: i64 = 1_700_000_000;
+    let target_secret = b"target_user_secret";
+    let target_ts = (now - 1) as u32;
+    let handshake = make_valid_tls_handshake(target_secret, target_ts);
+
+    let mut secrets = Vec::new();
+    for i in 0..512u32 {
+        secrets.push((format!("noise-{i}"), format!("noise-secret-{i}").into_bytes()));
+    }
+    secrets.push(("target-user".to_string(), target_secret.to_vec()));
+
+    let result = validate_tls_handshake_at_time_with_boot_cap(&handshake, &secrets, false, now, 0)
+        .expect("matching user should validate within strict skew window");
+    assert_eq!(result.user, "target-user");
+}
+
+#[test]
+fn light_fuzz_ignore_time_skew_accepts_wide_timestamp_range_with_valid_hmac() {
+    let secret = b"ignore_skew_fuzz_accept_test";
+    let secrets = vec![("u".to_string(), secret.to_vec())];
+    let mut s: u64 = 0xC0FF_EE11_2233_4455;
+
+    for _ in 0..2048 {
+        s ^= s << 7;
+        s ^= s >> 9;
+        s ^= s << 8;
+        let ts = s as u32;
+
+        let h = make_valid_tls_handshake(secret, ts);
+        let result = validate_tls_handshake_with_replay_window(&h, &secrets, true, 60);
+        assert!(
+            result.is_some(),
+            "ignore_time_skew=true must accept valid HMAC for arbitrary timestamp"
+        );
+    }
+}
+
+#[test]
+fn light_fuzz_small_replay_window_rejects_far_timestamps_when_skew_enabled() {
+    let secret = b"replay_window_reject_fuzz_test";
+    let secrets = vec![("u".to_string(), secret.to_vec())];
+
+    for ts in 300u32..=1323u32 {
+        let h = make_valid_tls_handshake(secret, ts);
+        let result = validate_tls_handshake_at_time_with_boot_cap(&h, &secrets, false, 0, 300);
+        assert!(
+            result.is_none(),
+            "with skew checks enabled and boot cap=300, timestamp >=300 at now=0 must be rejected"
+        );
+    }
+}
+
 // ------------------------------------------------------------------
 // Extreme timestamp values
 // ------------------------------------------------------------------
@@ -897,7 +1137,9 @@ fn first_matching_user_wins_over_later_duplicate_secret() {
 #[test]
 fn test_is_tls_handshake() {
     assert!(is_tls_handshake(&[0x16, 0x03, 0x01]));
+    assert!(is_tls_handshake(&[0x16, 0x03, 0x03]));
     assert!(is_tls_handshake(&[0x16, 0x03, 0x01, 0x02, 0x00]));
+    assert!(is_tls_handshake(&[0x16, 0x03, 0x03, 0x02, 0x00]));
     assert!(!is_tls_handshake(&[0x17, 0x03, 0x01]));
     assert!(!is_tls_handshake(&[0x16, 0x03, 0x02]));
     assert!(!is_tls_handshake(&[0x16, 0x03]));
@@ -1501,4 +1743,84 @@ fn server_hello_new_session_ticket_count_matches_configuration() {
         1 + tickets as usize,
         "response must contain one main application record plus configured ticket-like tail records"
     );
+}
+
+#[test]
+fn exhaustive_tls_minor_version_classification_matches_policy() {
+    for minor in 0u8..=u8::MAX {
+        let first = [TLS_RECORD_HANDSHAKE, 0x03, minor];
+        let expected = minor == 0x01 || minor == 0x03;
+        assert_eq!(
+            is_tls_handshake(&first),
+            expected,
+            "minor version {minor:#04x} classification mismatch"
+        );
+    }
+}
+
+#[test]
+fn light_fuzz_tls_header_classifier_and_parser_policy_consistency() {
+    // Deterministic xorshift state keeps this fuzz test reproducible.
+    let mut s: u64 = 0x9E37_79B9_AA95_5A5D;
+
+    for _ in 0..10_000 {
+        s ^= s << 7;
+        s ^= s >> 9;
+        s ^= s << 8;
+
+        let header = [
+            (s & 0xff) as u8,
+            ((s >> 8) & 0xff) as u8,
+            ((s >> 16) & 0xff) as u8,
+            ((s >> 24) & 0xff) as u8,
+            ((s >> 32) & 0xff) as u8,
+        ];
+
+        let classified = is_tls_handshake(&header[..3]);
+        let expected_classified = header[0] == TLS_RECORD_HANDSHAKE
+            && header[1] == 0x03
+            && (header[2] == 0x01 || header[2] == 0x03);
+        assert_eq!(
+            classified,
+            expected_classified,
+            "classifier policy mismatch for header {header:02x?}"
+        );
+
+        let parsed = parse_tls_record_header(&header);
+        let expected_parsed = header[1] == 0x03 && (header[2] == 0x01 || header[2] == TLS_VERSION[1]);
+        assert_eq!(
+            parsed.is_some(),
+            expected_parsed,
+            "parser policy mismatch for header {header:02x?}"
+        );
+    }
+}
+
+#[test]
+fn stress_random_noise_handshakes_never_authenticate() {
+    let secret = b"stress_noise_secret";
+    let secrets = vec![("noise-user".to_string(), secret.to_vec())];
+
+    // Deterministic xorshift state keeps this stress test reproducible.
+    let mut s: u64 = 0xD1B5_4A32_9C6E_77F1;
+
+    for _ in 0..5_000 {
+        s ^= s << 7;
+        s ^= s >> 9;
+        s ^= s << 8;
+
+        let len = 1 + ((s as usize) % 196);
+        let mut buf = vec![0u8; len];
+        for b in &mut buf {
+            s ^= s << 7;
+            s ^= s >> 9;
+            s ^= s << 8;
+            *b = (s & 0xff) as u8;
+        }
+
+        assert!(
+            validate_tls_handshake(&buf, &secrets, true).is_none(),
+            "random noise must never authenticate"
+        );
+    }
 }

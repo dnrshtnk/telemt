@@ -27,6 +27,10 @@ pub const TLS_DIGEST_POS: usize = 11;
 pub const TLS_DIGEST_HALF_LEN: usize = 16;
 
 /// Time skew limits for anti-replay (in seconds)
+///
+/// The default window is intentionally narrow to reduce replay acceptance.
+/// Operators with known clock-drifted clients should tune deployment config
+/// (for example replay-window policy) to match their environment.
 pub const TIME_SKEW_MIN: i64 = -2 * 60; // 2 minutes before
 pub const TIME_SKEW_MAX: i64 = 2 * 60;  // 2 minutes after
 /// Maximum accepted boot-time timestamp (seconds) before skew checks are enforced.
@@ -316,7 +320,14 @@ pub fn validate_tls_handshake_with_replay_window(
     };
 
     let replay_window_u32 = u32::try_from(replay_window_secs).unwrap_or(u32::MAX);
-    let boot_time_cap_secs = BOOT_TIME_MAX_SECS.min(replay_window_u32);
+    // Boot-time bypass and ignore_time_skew serve different compatibility paths.
+    // When skew checks are disabled, force boot-time cap to zero to prevent
+    // accidental future coupling of boot-time logic into the ignore-skew path.
+    let boot_time_cap_secs = if ignore_time_skew {
+        0
+    } else {
+        BOOT_TIME_MAX_SECS.min(replay_window_u32)
+    };
 
     validate_tls_handshake_at_time_with_boot_cap(
         handshake,
@@ -411,7 +422,7 @@ fn validate_tls_handshake_at_time_with_boot_cap(
         if !ignore_time_skew {
             // Allow very small timestamps (boot time instead of unix time)
             // This is a quirk in some clients that use uptime instead of real time
-            let is_boot_time = timestamp < boot_time_cap_secs;
+            let is_boot_time = boot_time_cap_secs > 0 && timestamp < boot_time_cap_secs;
             if !is_boot_time {
                 let time_diff = now - i64::from(timestamp);
                 if !(TIME_SKEW_MIN..=TIME_SKEW_MAX).contains(&time_diff) {
@@ -705,10 +716,10 @@ pub fn is_tls_handshake(first_bytes: &[u8]) -> bool {
         return false;
     }
     
-    // TLS record header: 0x16 (handshake) 0x03 0x01 (TLS 1.0)
+    // TLS ClientHello commonly uses legacy record versions 0x0301 or 0x0303.
     first_bytes[0] == TLS_RECORD_HANDSHAKE 
         && first_bytes[1] == 0x03 
-        && first_bytes[2] == 0x01
+        && (first_bytes[2] == 0x01 || first_bytes[2] == 0x03)
 }
 
 /// Parse TLS record header, returns (record_type, length)

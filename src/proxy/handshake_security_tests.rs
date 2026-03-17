@@ -86,6 +86,77 @@ fn make_valid_tls_client_hello_with_alpn(
     record
 }
 
+fn make_valid_tls_client_hello_with_sni_and_alpn(
+    secret: &[u8],
+    timestamp: u32,
+    sni_host: &str,
+    alpn_protocols: &[&[u8]],
+) -> Vec<u8> {
+    let mut body = Vec::new();
+    body.extend_from_slice(&TLS_VERSION);
+    body.extend_from_slice(&[0u8; 32]);
+    body.push(32);
+    body.extend_from_slice(&[0x42u8; 32]);
+    body.extend_from_slice(&2u16.to_be_bytes());
+    body.extend_from_slice(&[0x13, 0x01]);
+    body.push(1);
+    body.push(0);
+
+    let mut ext_blob = Vec::new();
+
+    let host_bytes = sni_host.as_bytes();
+    let mut sni_payload = Vec::new();
+    sni_payload.extend_from_slice(&((host_bytes.len() + 3) as u16).to_be_bytes());
+    sni_payload.push(0);
+    sni_payload.extend_from_slice(&(host_bytes.len() as u16).to_be_bytes());
+    sni_payload.extend_from_slice(host_bytes);
+    ext_blob.extend_from_slice(&0x0000u16.to_be_bytes());
+    ext_blob.extend_from_slice(&(sni_payload.len() as u16).to_be_bytes());
+    ext_blob.extend_from_slice(&sni_payload);
+
+    if !alpn_protocols.is_empty() {
+        let mut alpn_list = Vec::new();
+        for proto in alpn_protocols {
+            alpn_list.push(proto.len() as u8);
+            alpn_list.extend_from_slice(proto);
+        }
+        let mut alpn_data = Vec::new();
+        alpn_data.extend_from_slice(&(alpn_list.len() as u16).to_be_bytes());
+        alpn_data.extend_from_slice(&alpn_list);
+
+        ext_blob.extend_from_slice(&0x0010u16.to_be_bytes());
+        ext_blob.extend_from_slice(&(alpn_data.len() as u16).to_be_bytes());
+        ext_blob.extend_from_slice(&alpn_data);
+    }
+
+    body.extend_from_slice(&(ext_blob.len() as u16).to_be_bytes());
+    body.extend_from_slice(&ext_blob);
+
+    let mut handshake = Vec::new();
+    handshake.push(0x01);
+    let body_len = (body.len() as u32).to_be_bytes();
+    handshake.extend_from_slice(&body_len[1..4]);
+    handshake.extend_from_slice(&body);
+
+    let mut record = Vec::new();
+    record.push(TLS_RECORD_HANDSHAKE);
+    record.extend_from_slice(&[0x03, 0x01]);
+    record.extend_from_slice(&(handshake.len() as u16).to_be_bytes());
+    record.extend_from_slice(&handshake);
+
+    record[tls::TLS_DIGEST_POS..tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN].fill(0);
+    let computed = sha256_hmac(secret, &record);
+    let mut digest = computed;
+    let ts = timestamp.to_le_bytes();
+    for i in 0..4 {
+        digest[28 + i] ^= ts[i];
+    }
+    record[tls::TLS_DIGEST_POS..tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN]
+        .copy_from_slice(&digest);
+
+    record
+}
+
 fn test_config_with_secret_hex(secret_hex: &str) -> ProxyConfig {
     let mut cfg = ProxyConfig::default();
     cfg.access.users.clear();
@@ -333,6 +404,45 @@ async fn tls_replay_second_identical_handshake_is_rejected() {
 }
 
 #[tokio::test]
+async fn tls_replay_with_ignore_time_skew_and_small_boot_timestamp_is_still_blocked() {
+    let secret = [0x19u8; 16];
+    let config = test_config_with_secret_hex("19191919191919191919191919191919");
+    let replay_checker = ReplayChecker::new(128, Duration::from_secs(60));
+    let rng = SecureRandom::new();
+    let peer: SocketAddr = "198.51.100.121:44321".parse().unwrap();
+    let handshake = make_valid_tls_handshake(&secret, 1);
+
+    let first = handle_tls_handshake(
+        &handshake,
+        tokio::io::empty(),
+        tokio::io::sink(),
+        peer,
+        &config,
+        &replay_checker,
+        &rng,
+        None,
+    )
+    .await;
+    assert!(matches!(first, HandshakeResult::Success(_)));
+
+    let replay = handle_tls_handshake(
+        &handshake,
+        tokio::io::empty(),
+        tokio::io::sink(),
+        peer,
+        &config,
+        &replay_checker,
+        &rng,
+        None,
+    )
+    .await;
+    assert!(
+        matches!(replay, HandshakeResult::BadClient { .. }),
+        "ignore_time_skew must not weaken replay rejection for small boot timestamps"
+    );
+}
+
+#[tokio::test]
 async fn tls_replay_concurrent_identical_handshake_allows_exactly_one_success() {
     let secret = [0x77u8; 16];
     let config = Arc::new(test_config_with_secret_hex("77777777777777777777777777777777"));
@@ -374,6 +484,177 @@ async fn tls_replay_concurrent_identical_handshake_allows_exactly_one_success() 
     assert_eq!(
         success_count, 1,
         "Concurrent replay attempts must allow exactly one successful handshake"
+    );
+}
+
+#[tokio::test]
+async fn tls_replay_matrix_rotating_peers_first_accept_then_rejects() {
+    let secret = [0x52u8; 16];
+    let config = test_config_with_secret_hex("52525252525252525252525252525252");
+    let replay_checker = ReplayChecker::new(4096, Duration::from_secs(60));
+    let rng = SecureRandom::new();
+    let handshake = make_valid_tls_handshake(&secret, 17);
+
+    let first_peer: SocketAddr = "198.51.100.31:44001".parse().unwrap();
+    let first = handle_tls_handshake(
+        &handshake,
+        tokio::io::empty(),
+        tokio::io::sink(),
+        first_peer,
+        &config,
+        &replay_checker,
+        &rng,
+        None,
+    )
+    .await;
+    assert!(matches!(first, HandshakeResult::Success(_)));
+
+    for i in 0..128u16 {
+        let peer = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::new(198, 51, 100, ((i % 250) + 1) as u8)),
+            45000 + i,
+        );
+        let replay = handle_tls_handshake(
+            &handshake,
+            tokio::io::empty(),
+            tokio::io::sink(),
+            peer,
+            &config,
+            &replay_checker,
+            &rng,
+            None,
+        )
+        .await;
+        assert!(
+            matches!(replay, HandshakeResult::BadClient { .. }),
+            "replay digest must be rejected regardless of source peer rotation"
+        );
+    }
+}
+
+#[tokio::test]
+async fn adversarial_tls_replay_churn_allows_only_unique_digests() {
+    let secret = [0x5Au8; 16];
+    let mut config = test_config_with_secret_hex("5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a");
+    config.access.ignore_time_skew = true;
+    let config = Arc::new(config);
+    let replay_checker = Arc::new(ReplayChecker::new(8192, Duration::from_secs(60)));
+    let rng = Arc::new(SecureRandom::new());
+
+    let make_tagged_handshake = |timestamp: u32, tag: u8| {
+        let session_id_len: usize = 32;
+        let len = tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN + 1 + session_id_len;
+        let mut handshake = vec![tag; len];
+
+        handshake[tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN] = session_id_len as u8;
+        handshake[tls::TLS_DIGEST_POS..tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN].fill(0);
+        let computed = sha256_hmac(&secret, &handshake);
+        let mut digest = computed;
+        let ts = timestamp.to_le_bytes();
+        for i in 0..4 {
+            digest[28 + i] ^= ts[i];
+        }
+
+        handshake[tls::TLS_DIGEST_POS..tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN]
+            .copy_from_slice(&digest);
+        handshake
+    };
+
+    let mut tasks = Vec::new();
+
+    // 128 exact duplicates: only one should pass.
+    let duplicated = Arc::new(make_valid_tls_handshake(&secret, 999));
+    for i in 0..128u16 {
+        let config = Arc::clone(&config);
+        let replay_checker = Arc::clone(&replay_checker);
+        let rng = Arc::clone(&rng);
+        let duplicated = Arc::clone(&duplicated);
+        tasks.push(tokio::spawn(async move {
+            let peer = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(203, 0, 113, ((i % 250) + 1) as u8)),
+                46000 + i,
+            );
+            handle_tls_handshake(
+                &duplicated,
+                tokio::io::empty(),
+                tokio::io::sink(),
+                peer,
+                &config,
+                &replay_checker,
+                &rng,
+                None,
+            )
+            .await
+        }));
+    }
+
+    // 128 unique timestamps: all should pass because HMAC digest differs.
+    for i in 0..128u16 {
+        let config = Arc::clone(&config);
+        let replay_checker = Arc::clone(&replay_checker);
+        let rng = Arc::clone(&rng);
+        let handshake = make_tagged_handshake(10_000 + i as u32, (i as u8).wrapping_add(0x80));
+        tasks.push(tokio::spawn(async move {
+            let peer = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(198, 18, 0, ((i % 250) + 1) as u8)),
+                47000 + i,
+            );
+            handle_tls_handshake(
+                &handshake,
+                tokio::io::empty(),
+                tokio::io::sink(),
+                peer,
+                &config,
+                &replay_checker,
+                &rng,
+                None,
+            )
+            .await
+        }));
+    }
+
+    let mut duplicate_success = 0usize;
+    let mut duplicate_reject = 0usize;
+    let mut unique_success = 0usize;
+    let mut unique_reject = 0usize;
+
+    for (idx, task) in tasks.into_iter().enumerate() {
+        let result = task.await.unwrap();
+        let is_duplicate_group = idx < 128;
+        match result {
+            HandshakeResult::Success(_) => {
+                if is_duplicate_group {
+                    duplicate_success += 1;
+                } else {
+                    unique_success += 1;
+                }
+            }
+            HandshakeResult::BadClient { .. } => {
+                if is_duplicate_group {
+                    duplicate_reject += 1;
+                } else {
+                    unique_reject += 1;
+                }
+            }
+            HandshakeResult::Error(e) => panic!("unexpected handshake error in churn test: {e}"),
+        }
+    }
+
+    assert_eq!(
+        duplicate_success, 1,
+        "duplicate replay group must allow exactly one successful handshake"
+    );
+    assert_eq!(
+        duplicate_reject, 127,
+        "duplicate replay group must reject all remaining replays"
+    );
+    assert_eq!(
+        unique_success, 128,
+        "unique digest group must fully pass under replay churn"
+    );
+    assert_eq!(
+        unique_reject, 0,
+        "unique digest group must not be falsely rejected as replay"
     );
 }
 
@@ -528,6 +809,149 @@ async fn mixed_secret_lengths_keep_valid_user_authenticating() {
     .await;
 
     assert!(matches!(result, HandshakeResult::Success(_)));
+}
+
+#[tokio::test]
+async fn tls_sni_preferred_user_hint_selects_matching_identity_first() {
+    let shared_secret = [0x3Bu8; 16];
+    let mut config = ProxyConfig::default();
+    config.access.users.clear();
+    config.access.users.insert(
+        "user-a".to_string(),
+        "3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b".to_string(),
+    );
+    config.access.users.insert(
+        "user-b".to_string(),
+        "3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b3b".to_string(),
+    );
+    config.access.ignore_time_skew = true;
+
+    let replay_checker = ReplayChecker::new(128, Duration::from_secs(60));
+    let rng = SecureRandom::new();
+    let peer: SocketAddr = "198.51.100.188:44326".parse().unwrap();
+    let handshake = make_valid_tls_client_hello_with_sni_and_alpn(
+        &shared_secret,
+        0,
+        "user-b",
+        &[b"h2"],
+    );
+
+    let result = handle_tls_handshake(
+        &handshake,
+        tokio::io::empty(),
+        tokio::io::sink(),
+        peer,
+        &config,
+        &replay_checker,
+        &rng,
+        None,
+    )
+    .await;
+
+    match result {
+        HandshakeResult::Success((_, _, user)) => {
+            assert_eq!(
+                user, "user-b",
+                "TLS SNI preferred-user hint must select matching identity before equivalent decoys"
+            );
+        }
+        _ => panic!("TLS handshake must succeed for valid shared-secret SNI case"),
+    }
+}
+
+#[test]
+fn stress_decode_user_secrets_keeps_preferred_user_first_in_large_set() {
+    let mut config = ProxyConfig::default();
+    config.access.users.clear();
+
+    let preferred_user = "target-user.example".to_string();
+    let secret_hex = "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f".to_string();
+
+    for i in 0..4096usize {
+        config.access.users.insert(
+            format!("decoy-{i:04}.example"),
+            secret_hex.clone(),
+        );
+    }
+    config
+        .access
+        .users
+        .insert(preferred_user.clone(), secret_hex.clone());
+
+    let decoded = decode_user_secrets(&config, Some(preferred_user.as_str()));
+    assert_eq!(
+        decoded.len(),
+        config.access.users.len(),
+        "decoded secret set must preserve full user cardinality under stress"
+    );
+    assert_eq!(
+        decoded.first().map(|(name, _)| name.as_str()),
+        Some(preferred_user.as_str()),
+        "preferred user must be first even under adversarial large user sets"
+    );
+    assert_eq!(
+        decoded
+            .iter()
+            .filter(|(name, _)| name == &preferred_user)
+            .count(),
+        1,
+        "preferred user must appear exactly once in decoded list"
+    );
+}
+
+#[tokio::test]
+async fn stress_tls_sni_preferred_user_hint_scales_to_large_user_set() {
+    let shared_secret = [0x7Fu8; 16];
+    let mut config = ProxyConfig::default();
+    config.access.users.clear();
+    config.access.ignore_time_skew = true;
+
+    let preferred_user = "target-user.example".to_string();
+    let secret_hex = "7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f7f".to_string();
+
+    for i in 0..4096usize {
+        config.access.users.insert(
+            format!("decoy-{i:04}.example"),
+            secret_hex.clone(),
+        );
+    }
+    config
+        .access
+        .users
+        .insert(preferred_user.clone(), secret_hex);
+
+    let replay_checker = ReplayChecker::new(128, Duration::from_secs(60));
+    let rng = SecureRandom::new();
+    let peer: SocketAddr = "198.51.100.189:44326".parse().unwrap();
+    let handshake = make_valid_tls_client_hello_with_sni_and_alpn(
+        &shared_secret,
+        0,
+        preferred_user.as_str(),
+        &[b"h2"],
+    );
+
+    let result = handle_tls_handshake(
+        &handshake,
+        tokio::io::empty(),
+        tokio::io::sink(),
+        peer,
+        &config,
+        &replay_checker,
+        &rng,
+        None,
+    )
+    .await;
+
+    match result {
+        HandshakeResult::Success((_, _, user)) => {
+            assert_eq!(
+                user,
+                preferred_user,
+                "SNI preferred-user hint must remain stable under large user cardinality"
+            );
+        }
+        _ => panic!("TLS handshake must succeed for valid preferred-user stress case"),
+    }
 }
 
 #[tokio::test]
@@ -1053,7 +1477,12 @@ fn auth_probe_capacity_prunes_stale_entries_for_new_ips() {
 }
 
 #[test]
-fn auth_probe_capacity_saturation_enables_global_throttle_when_map_is_fresh_and_full() {
+fn auth_probe_capacity_fresh_full_map_still_tracks_newcomer_with_bounded_eviction() {
+    let _guard = auth_probe_test_lock()
+        .lock()
+        .expect("auth probe test lock must be available");
+    clear_auth_probe_state_for_testing();
+
     let state = DashMap::new();
     let now = Instant::now();
 
@@ -1069,27 +1498,90 @@ fn auth_probe_capacity_saturation_enables_global_throttle_when_map_is_fresh_and_
             AuthProbeState {
                 fail_streak: 1,
                 blocked_until: now,
-                last_seen: now,
+                last_seen: now + Duration::from_millis(idx as u64 + 1),
             },
         );
     }
+
+    let oldest = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 0));
+    state.insert(
+        oldest,
+        AuthProbeState {
+            fail_streak: 1,
+            blocked_until: now,
+            last_seen: now - Duration::from_secs(5),
+        },
+    );
 
     let newcomer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 55));
     auth_probe_record_failure_with_state(&state, newcomer, now);
 
     assert!(
-        state.get(&newcomer).is_none(),
-        "fresh-at-cap auth probe state must not churn by evicting tracked sources"
+        state.get(&newcomer).is_some(),
+        "fresh-at-cap auth probe map must still track a new source after bounded eviction"
+    );
+    assert!(
+        state.get(&oldest).is_none(),
+        "capacity eviction must remove the oldest tracked source first"
     );
     assert_eq!(
         state.len(),
         AUTH_PROBE_TRACK_MAX_ENTRIES,
-        "auth probe map must stay exactly at the configured cap under saturation"
+        "auth probe map must stay at configured cap after bounded eviction"
     );
     assert!(
-        auth_probe_saturation_is_throttled_for_testing(),
-        "capacity saturation must activate coarse global pre-auth throttling"
+        auth_probe_saturation_is_throttled_at_for_testing(now),
+        "capacity pressure should still activate coarse global pre-auth throttling"
     );
+}
+
+#[test]
+fn stress_auth_probe_full_map_churn_keeps_bound_and_tracks_newcomers() {
+    let _guard = auth_probe_test_lock()
+        .lock()
+        .expect("auth probe test lock must be available");
+    clear_auth_probe_state_for_testing();
+
+    let state = DashMap::new();
+    let base_now = Instant::now();
+
+    for idx in 0..AUTH_PROBE_TRACK_MAX_ENTRIES {
+        let ip = IpAddr::V4(Ipv4Addr::new(
+            10,
+            2,
+            ((idx >> 8) & 0xff) as u8,
+            (idx & 0xff) as u8,
+        ));
+        state.insert(
+            ip,
+            AuthProbeState {
+                fail_streak: 1,
+                blocked_until: base_now,
+                last_seen: base_now + Duration::from_millis((idx % 2048) as u64),
+            },
+        );
+    }
+
+    for step in 0..1024usize {
+        let newcomer = IpAddr::V4(Ipv4Addr::new(
+            203,
+            0,
+            ((step >> 8) & 0xff) as u8,
+            (step & 0xff) as u8,
+        ));
+        let now = base_now + Duration::from_millis(10_000 + step as u64);
+        auth_probe_record_failure_with_state(&state, newcomer, now);
+
+        assert!(
+            state.get(&newcomer).is_some(),
+            "new source must still be tracked under sustained at-capacity churn"
+        );
+        assert_eq!(
+            state.len(),
+            AUTH_PROBE_TRACK_MAX_ENTRIES,
+            "auth probe map size must stay hard-bounded at capacity"
+        );
+    }
 }
 
 #[test]

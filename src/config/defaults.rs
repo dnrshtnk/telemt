@@ -73,6 +73,8 @@ pub(crate) fn default_replay_check_len() -> usize {
 }
 
 pub(crate) fn default_replay_window_secs() -> u64 {
+    // Keep replay cache TTL tight by default to reduce replay surface.
+    // Deployments with higher RTT or longer reconnect jitter can override this in config.
     120
 }
 

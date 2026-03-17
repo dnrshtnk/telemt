@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::watch;
 
-pub(crate) const ROUTE_SWITCH_ERROR_MSG: &str = "Route mode switched by cutover";
+pub(crate) const ROUTE_SWITCH_ERROR_MSG: &str = "Session terminated";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
@@ -140,3 +140,7 @@ pub(crate) fn cutover_stagger_delay(session_id: u64, generation: u64) -> Duratio
     let ms = 1000 + (value % 1000);
     Duration::from_millis(ms)
 }
+
+#[cfg(test)]
+#[path = "route_mode_security_tests.rs"]
+mod security_tests;

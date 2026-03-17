@@ -362,6 +362,93 @@ async fn short_tls_probe_is_masked_through_client_pipeline() {
 }
 
 #[tokio::test]
+async fn tls12_record_probe_is_masked_through_client_pipeline() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let backend_addr = listener.local_addr().unwrap();
+    let probe = vec![0x16, 0x03, 0x03, 0x00, 0x10];
+    let backend_reply = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK".to_vec();
+
+    let accept_task = tokio::spawn({
+        let probe = probe.clone();
+        let backend_reply = backend_reply.clone();
+        async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut got = vec![0u8; probe.len()];
+            stream.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, probe);
+            stream.write_all(&backend_reply).await.unwrap();
+        }
+    });
+
+    let mut cfg = ProxyConfig::default();
+    cfg.general.beobachten = false;
+    cfg.censorship.mask = true;
+    cfg.censorship.mask_unix_sock = None;
+    cfg.censorship.mask_host = Some("127.0.0.1".to_string());
+    cfg.censorship.mask_port = backend_addr.port();
+    cfg.censorship.mask_proxy_protocol = 0;
+
+    let config = Arc::new(cfg);
+    let stats = Arc::new(Stats::new());
+    let upstream_manager = Arc::new(UpstreamManager::new(
+        vec![UpstreamConfig {
+            upstream_type: UpstreamType::Direct {
+                interface: None,
+                bind_addresses: None,
+            },
+            weight: 1,
+            enabled: true,
+            scopes: String::new(),
+            selected_scope: String::new(),
+        }],
+        1,
+        1,
+        1,
+        1,
+        false,
+        stats.clone(),
+    ));
+    let replay_checker = Arc::new(ReplayChecker::new(128, Duration::from_secs(60)));
+    let buffer_pool = Arc::new(BufferPool::new());
+    let rng = Arc::new(SecureRandom::new());
+    let route_runtime = Arc::new(RouteRuntimeController::new(RelayRouteMode::Direct));
+    let ip_tracker = Arc::new(UserIpTracker::new());
+    let beobachten = Arc::new(BeobachtenStore::new());
+
+    let (server_side, mut client_side) = duplex(4096);
+    let peer: SocketAddr = "203.0.113.78:55001".parse().unwrap();
+
+    let handler = tokio::spawn(handle_client_stream(
+        server_side,
+        peer,
+        config,
+        stats,
+        upstream_manager,
+        replay_checker,
+        buffer_pool,
+        rng,
+        None,
+        route_runtime,
+        None,
+        ip_tracker,
+        beobachten,
+        false,
+    ));
+
+    client_side.write_all(&probe).await.unwrap();
+    let mut observed = vec![0u8; backend_reply.len()];
+    client_side.read_exact(&mut observed).await.unwrap();
+    assert_eq!(observed, backend_reply);
+
+    drop(client_side);
+    let _ = tokio::time::timeout(Duration::from_secs(3), handler)
+        .await
+        .unwrap()
+        .unwrap();
+    accept_task.await.unwrap();
+}
+
+#[tokio::test]
 async fn handle_client_stream_increments_connects_all_exactly_once() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let backend_addr = listener.local_addr().unwrap();
@@ -1381,6 +1468,34 @@ fn non_eof_error_is_classified_as_other() {
     );
 }
 
+#[test]
+fn beobachten_ttl_zero_minutes_is_floored_to_one_minute() {
+    let mut config = ProxyConfig::default();
+    config.general.beobachten = true;
+    config.general.beobachten_minutes = 0;
+
+    let ttl = beobachten_ttl(&config);
+    assert_eq!(
+        ttl,
+        Duration::from_secs(60),
+        "beobachten_minutes=0 must be fail-closed to a one-minute minimum TTL"
+    );
+}
+
+#[test]
+fn beobachten_ttl_positive_minutes_remain_unchanged() {
+    let mut config = ProxyConfig::default();
+    config.general.beobachten = true;
+    config.general.beobachten_minutes = 7;
+
+    let ttl = beobachten_ttl(&config);
+    assert_eq!(
+        ttl,
+        Duration::from_secs(7 * 60),
+        "configured positive beobacten TTL must be preserved"
+    );
+}
+
 #[tokio::test]
 async fn tcp_limit_rejection_does_not_reserve_ip_or_trigger_rollback() {
     let mut config = ProxyConfig::default();
@@ -1447,6 +1562,83 @@ async fn zero_tcp_limit_rejects_without_ip_or_counter_side_effects() {
     ));
     assert_eq!(stats.get_user_curr_connects("user"), 0);
     assert_eq!(ip_tracker.get_active_ip_count("user").await, 0);
+}
+
+#[tokio::test]
+async fn check_user_limits_static_success_does_not_leak_counter_or_ip_reservation() {
+    let user = "check-helper-user";
+    let mut config = ProxyConfig::default();
+    config
+        .access
+        .user_max_tcp_conns
+        .insert(user.to_string(), 1);
+
+    let stats = Stats::new();
+    let ip_tracker = UserIpTracker::new();
+    let peer_addr: SocketAddr = "198.51.100.212:50002".parse().unwrap();
+
+    let first = RunningClientHandler::check_user_limits_static(
+        user,
+        &config,
+        &stats,
+        peer_addr,
+        &ip_tracker,
+    )
+    .await;
+    assert!(first.is_ok(), "first check-only limit validation must succeed");
+
+    let second = RunningClientHandler::check_user_limits_static(
+        user,
+        &config,
+        &stats,
+        peer_addr,
+        &ip_tracker,
+    )
+    .await;
+    assert!(second.is_ok(), "second check-only validation must not fail from leaked state");
+    assert_eq!(stats.get_user_curr_connects(user), 0);
+    assert_eq!(ip_tracker.get_active_ip_count(user).await, 0);
+}
+
+#[tokio::test]
+async fn stress_check_user_limits_static_success_never_leaks_state() {
+    let user = "check-helper-stress-user";
+    let mut config = ProxyConfig::default();
+    config
+        .access
+        .user_max_tcp_conns
+        .insert(user.to_string(), 1);
+
+    let stats = Stats::new();
+    let ip_tracker = UserIpTracker::new();
+
+    for i in 0..4096u16 {
+        let peer_addr = SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::new(198, 51, 110, (i % 250) as u8 + 1)),
+            40000 + (i % 1024),
+        );
+
+        let result = RunningClientHandler::check_user_limits_static(
+            user,
+            &config,
+            &stats,
+            peer_addr,
+            &ip_tracker,
+        )
+        .await;
+        assert!(result.is_ok(), "check-only helper must remain leak-free under stress");
+    }
+
+    assert_eq!(
+        stats.get_user_curr_connects(user),
+        0,
+        "stress success loop must not leak user connection counters"
+    );
+    assert_eq!(
+        ip_tracker.get_active_ip_count(user).await,
+        0,
+        "stress success loop must not leak active IP reservations"
+    );
 }
 
 #[tokio::test]
@@ -1676,6 +1868,249 @@ async fn explicit_release_allows_immediate_cross_ip_reacquire_under_limit() {
 
     assert_eq!(stats.get_user_curr_connects(user), 0);
     assert_eq!(ip_tracker.get_active_ip_count(user).await, 0);
+}
+
+#[tokio::test]
+async fn release_abort_storm_does_not_leak_user_or_ip_reservations() {
+    const ATTEMPTS: usize = 256;
+
+    let user = "release-abort-storm-user";
+    let mut config = ProxyConfig::default();
+    config
+        .access
+        .user_max_tcp_conns
+        .insert(user.to_string(), ATTEMPTS + 16);
+
+    let stats = Arc::new(Stats::new());
+    let ip_tracker = Arc::new(UserIpTracker::new());
+
+    for idx in 0..ATTEMPTS {
+        let peer = SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 114, (idx % 250 + 1) as u8)),
+            52000 + idx as u16,
+        );
+        let reservation = RunningClientHandler::acquire_user_connection_reservation_static(
+            user,
+            &config,
+            stats.clone(),
+            peer,
+            ip_tracker.clone(),
+        )
+        .await
+        .expect("reservation acquisition must succeed in abort storm");
+
+        let release_task = tokio::spawn(async move {
+            reservation.release().await;
+        });
+        release_task.abort();
+        let _ = release_task.await;
+    }
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if stats.get_user_curr_connects(user) == 0
+                && ip_tracker.get_active_ip_count(user).await == 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("release abort storm must not leak user slots or active IP entries");
+}
+
+#[tokio::test]
+async fn release_abort_loop_preserves_immediate_same_ip_reacquire() {
+    const ITERATIONS: usize = 128;
+
+    let user = "release-abort-reacquire-user";
+    let peer: SocketAddr = "198.51.100.246:53001".parse().unwrap();
+
+    let mut config = ProxyConfig::default();
+    config.access.user_max_tcp_conns.insert(user.to_string(), 1);
+
+    let stats = Arc::new(Stats::new());
+    let ip_tracker = Arc::new(UserIpTracker::new());
+
+    for _ in 0..ITERATIONS {
+        let reservation = RunningClientHandler::acquire_user_connection_reservation_static(
+            user,
+            &config,
+            stats.clone(),
+            peer,
+            ip_tracker.clone(),
+        )
+        .await
+        .expect("baseline acquisition must succeed");
+
+        let release_task = tokio::spawn(async move {
+            reservation.release().await;
+        });
+        release_task.abort();
+        let _ = release_task.await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if stats.get_user_curr_connects(user) == 0
+                    && ip_tracker.get_active_ip_count(user).await == 0
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .expect("aborted release must still converge to zero footprint");
+    }
+
+    let reservation = RunningClientHandler::acquire_user_connection_reservation_static(
+        user,
+        &config,
+        stats.clone(),
+        peer,
+        ip_tracker.clone(),
+    )
+    .await
+    .expect("same-ip reacquire must succeed after repeated abort-release churn");
+    reservation.release().await;
+}
+
+#[tokio::test]
+async fn adversarial_mixed_release_drop_abort_wave_converges_to_zero() {
+    const RESERVATIONS: usize = 192;
+
+    let user = "mixed-wave-user";
+    let mut config = ProxyConfig::default();
+    config
+        .access
+        .user_max_tcp_conns
+        .insert(user.to_string(), RESERVATIONS + 8);
+
+    let stats = Arc::new(Stats::new());
+    let ip_tracker = Arc::new(UserIpTracker::new());
+
+    let mut reservations = Vec::with_capacity(RESERVATIONS);
+    for idx in 0..RESERVATIONS {
+        let peer = SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 115, (idx % 250 + 1) as u8)),
+            54000 + idx as u16,
+        );
+        let reservation = RunningClientHandler::acquire_user_connection_reservation_static(
+            user,
+            &config,
+            stats.clone(),
+            peer,
+            ip_tracker.clone(),
+        )
+        .await
+        .expect("mixed-wave acquisition must succeed");
+        reservations.push(reservation);
+    }
+
+    let mut seed: u64 = 0xDEAD_BEEF_CAFE_BA5E;
+    let mut join_set = tokio::task::JoinSet::new();
+    for reservation in reservations {
+        seed ^= seed << 7;
+        seed ^= seed >> 9;
+        seed ^= seed << 8;
+        match seed % 3 {
+            0 => {
+                join_set.spawn(async move {
+                    reservation.release().await;
+                });
+            }
+            1 => {
+                drop(reservation);
+            }
+            _ => {
+                let task = tokio::spawn(async move {
+                    reservation.release().await;
+                });
+                task.abort();
+                let _ = task.await;
+            }
+        }
+    }
+
+    while let Some(result) = join_set.join_next().await {
+        result.expect("release subtask must not panic");
+    }
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if stats.get_user_curr_connects(user) == 0
+                && ip_tracker.get_active_ip_count(user).await == 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("mixed release/drop/abort wave must converge to zero footprint");
+}
+
+#[tokio::test]
+async fn parallel_users_abort_release_isolation_preserves_independent_cleanup() {
+    let user_a = "abort-isolation-a";
+    let user_b = "abort-isolation-b";
+
+    let mut config = ProxyConfig::default();
+    config.access.user_max_tcp_conns.insert(user_a.to_string(), 64);
+    config.access.user_max_tcp_conns.insert(user_b.to_string(), 64);
+
+    let stats = Arc::new(Stats::new());
+    let ip_tracker = Arc::new(UserIpTracker::new());
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for idx in 0..64usize {
+        let user = if idx % 2 == 0 { user_a } else { user_b };
+        let peer = SocketAddr::new(
+            IpAddr::V4(std::net::Ipv4Addr::new(198, 18, 0, (idx % 250 + 1) as u8)),
+            55000 + idx as u16,
+        );
+        let reservation = RunningClientHandler::acquire_user_connection_reservation_static(
+            user,
+            &config,
+            stats.clone(),
+            peer,
+            ip_tracker.clone(),
+        )
+        .await
+        .expect("parallel-user acquisition must succeed");
+
+        tasks.spawn(async move {
+            let t = tokio::spawn(async move {
+                reservation.release().await;
+            });
+            t.abort();
+            let _ = t.await;
+        });
+    }
+
+    while let Some(result) = tasks.join_next().await {
+        result.expect("parallel-user abort task must not panic");
+    }
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if stats.get_user_curr_connects(user_a) == 0
+                && stats.get_user_curr_connects(user_b) == 0
+                && ip_tracker.get_active_ip_count(user_a).await == 0
+                && ip_tracker.get_active_ip_count(user_b).await == 0
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("parallel users must cleanup independently under abort churn");
 }
 
 #[tokio::test]
@@ -2301,16 +2736,24 @@ async fn atomic_limit_gate_allows_only_one_concurrent_acquire() {
                 IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, (i + 1) as u8)),
                 30000 + i,
             );
-            RunningClientHandler::check_user_limits_static("user", &config, &stats, peer, &ip_tracker)
-                .await
-                .is_ok()
+            RunningClientHandler::acquire_user_connection_reservation_static(
+                "user",
+                &config,
+                stats,
+                peer,
+                ip_tracker,
+            )
+            .await
+            .ok()
         });
     }
 
     let mut successes = 0u64;
+    let mut held_reservations = Vec::new();
     while let Some(joined) = tasks.join_next().await {
-        if joined.unwrap() {
+        if let Some(reservation) = joined.unwrap() {
             successes += 1;
+            held_reservations.push(reservation);
         }
     }
 
@@ -2319,6 +2762,8 @@ async fn atomic_limit_gate_allows_only_one_concurrent_acquire() {
         "exactly one concurrent acquire must pass for a limit=1 user"
     );
     assert_eq!(stats.get_user_curr_connects("user"), 1);
+
+    drop(held_reservations);
 }
 
 #[tokio::test]

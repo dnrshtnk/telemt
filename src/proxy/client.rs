@@ -51,9 +51,9 @@ impl UserConnectionReservation {
         if !self.active {
             return;
         }
+        self.ip_tracker.remove_ip(&self.user, self.ip).await;
         self.active = false;
         self.stats.decrement_user_curr_connects(&self.user);
-        self.ip_tracker.remove_ip(&self.user, self.ip).await;
     }
 }
 
@@ -111,7 +111,19 @@ use crate::proxy::middle_relay::handle_via_middle_proxy;
 use crate::proxy::route_mode::{RelayRouteMode, RouteRuntimeController};
 
 fn beobachten_ttl(config: &ProxyConfig) -> Duration {
-    Duration::from_secs(config.general.beobachten_minutes.saturating_mul(60))
+    let minutes = config.general.beobachten_minutes;
+    if minutes == 0 {
+        static BEOBACHTEN_ZERO_MINUTES_WARNED: OnceLock<AtomicBool> = OnceLock::new();
+        let warned = BEOBACHTEN_ZERO_MINUTES_WARNED.get_or_init(|| AtomicBool::new(false));
+        if !warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                "general.beobachten_minutes=0 is insecure because entries expire immediately; forcing minimum TTL to 1 minute"
+            );
+        }
+        return Duration::from_secs(60);
+    }
+
+    Duration::from_secs(minutes.saturating_mul(60))
 }
 
 fn record_beobachten_class(
@@ -494,7 +506,6 @@ impl RunningClientHandler {
     pub async fn run(self) -> Result<()> {
         self.stats.increment_connects_all();
         let peer = self.peer;
-        let _ip_tracker = self.ip_tracker.clone();
         debug!(peer = %peer, "New connection");
 
         if let Err(e) = configure_client_socket(
@@ -625,7 +636,6 @@ impl RunningClientHandler {
 
         let is_tls = tls::is_tls_handshake(&first_bytes[..3]);
         let peer = self.peer;
-        let _ip_tracker = self.ip_tracker.clone();
 
         debug!(peer = %peer, is_tls = is_tls, "Handshake type detected");
 
@@ -638,7 +648,6 @@ impl RunningClientHandler {
 
     async fn handle_tls_client(mut self, first_bytes: [u8; 5], local_addr: SocketAddr) -> Result<HandshakeOutcome> {
         let peer = self.peer;
-        let _ip_tracker = self.ip_tracker.clone();
 
         let tls_len = u16::from_be_bytes([first_bytes[3], first_bytes[4]]) as usize;
 
@@ -762,7 +771,6 @@ impl RunningClientHandler {
 
     async fn handle_direct_client(mut self, first_bytes: [u8; 5], local_addr: SocketAddr) -> Result<HandshakeOutcome> {
         let peer = self.peer;
-        let _ip_tracker = self.ip_tracker.clone();
 
         if !self.config.general.modes.classic && !self.config.general.modes.secure {
             debug!(peer = %peer, "Non-TLS modes disabled");
@@ -1032,7 +1040,10 @@ impl RunningClientHandler {
         }
 
         match ip_tracker.check_and_add(user, peer_addr.ip()).await {
-            Ok(()) => {}
+            Ok(()) => {
+                ip_tracker.remove_ip(user, peer_addr.ip()).await;
+                stats.decrement_user_curr_connects(user);
+            }
             Err(reason) => {
                 stats.decrement_user_curr_connects(user);
                 warn!(

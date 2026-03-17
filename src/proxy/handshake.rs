@@ -235,23 +235,31 @@ fn auth_probe_record_failure_with_state(
 
     if state.len() >= AUTH_PROBE_TRACK_MAX_ENTRIES {
         let mut stale_keys = Vec::new();
-        let mut eviction_candidates = Vec::new();
+        let mut oldest_candidate: Option<(IpAddr, Instant)> = None;
         for entry in state.iter().take(AUTH_PROBE_PRUNE_SCAN_LIMIT) {
-            eviction_candidates.push(*entry.key());
+            let key = *entry.key();
+            let last_seen = entry.value().last_seen;
+            match oldest_candidate {
+                Some((_, oldest_seen)) if last_seen >= oldest_seen => {}
+                _ => oldest_candidate = Some((key, last_seen)),
+            }
             if auth_probe_state_expired(entry.value(), now) {
-                stale_keys.push(*entry.key());
+                stale_keys.push(key);
             }
         }
         for stale_key in stale_keys {
             state.remove(&stale_key);
         }
         if state.len() >= AUTH_PROBE_TRACK_MAX_ENTRIES {
-            if eviction_candidates.is_empty() {
+            let Some((evict_key, _)) = oldest_candidate else {
                 auth_probe_note_saturation(now);
                 return;
-            }
+            };
+            state.remove(&evict_key);
             auth_probe_note_saturation(now);
-            return;
+            if state.len() >= AUTH_PROBE_TRACK_MAX_ENTRIES {
+                return;
+            }
         }
     }
 
@@ -298,6 +306,11 @@ fn auth_probe_is_throttled_for_testing(peer_ip: IpAddr) -> bool {
 #[cfg(test)]
 fn auth_probe_saturation_is_throttled_for_testing() -> bool {
     auth_probe_saturation_is_throttled(Instant::now())
+}
+
+#[cfg(test)]
+fn auth_probe_saturation_is_throttled_at_for_testing(now: Instant) -> bool {
+    auth_probe_saturation_is_throttled(now)
 }
 
 #[cfg(test)]
@@ -498,7 +511,8 @@ where
         return HandshakeResult::BadClient { reader, writer };
     }
 
-    let secrets = decode_user_secrets(config, None);
+    let client_sni = tls::extract_sni_from_client_hello(handshake);
+    let secrets = decode_user_secrets(config, client_sni.as_deref());
 
     let validation = match tls::validate_tls_handshake_with_replay_window(
         handshake,
@@ -539,9 +553,9 @@ where
 
     let cached = if config.censorship.tls_emulation {
         if let Some(cache) = tls_cache.as_ref() {
-            let selected_domain = if let Some(sni) = tls::extract_sni_from_client_hello(handshake) {
+            let selected_domain = if let Some(sni) = client_sni.as_ref() {
                 if cache.contains_domain(&sni).await {
-                    sni
+                    sni.clone()
                 } else {
                     config.censorship.tls_domain.clone()
                 }

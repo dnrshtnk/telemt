@@ -8,7 +8,9 @@ use crate::proxy::route_mode::{RelayRouteMode, RouteRuntimeController};
 use crate::stats::Stats;
 use crate::stream::{BufferPool, CryptoReader, CryptoWriter, PooledBuffer};
 use crate::transport::middle_proxy::MePool;
-use std::collections::HashMap;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -218,6 +220,190 @@ fn desync_dedup_full_cache_churn_stays_suppressed() {
             "fresh full-cache churn must remain suppressed under pressure"
         );
     }
+}
+
+#[test]
+fn dedup_hash_is_stable_for_same_input_within_process() {
+    let sample = (
+        "scope_user",
+        hash_ip("198.51.100.7".parse().unwrap()),
+        ProtoTag::Secure,
+    );
+    let first = hash_value(&sample);
+    let second = hash_value(&sample);
+    assert_eq!(
+        first, second,
+        "dedup hash must be stable within a process for cache lookups"
+    );
+}
+
+#[test]
+fn dedup_hash_resists_simple_collision_bursts_for_peer_ip_space() {
+    let mut seen = HashSet::new();
+
+    for octet in 1u16..=2048 {
+        let third = ((octet / 256) & 0xff) as u8;
+        let fourth = (octet & 0xff) as u8;
+        let ip = IpAddr::V4(std::net::Ipv4Addr::new(198, 51, third, fourth));
+        let key = hash_value(&(
+            "scope_user",
+            hash_ip(ip),
+            ProtoTag::Secure,
+            DESYNC_ERROR_CLASS,
+        ));
+        seen.insert(key);
+    }
+
+    assert_eq!(
+        seen.len(),
+        2048,
+        "adversarial peer-IP burst should not collapse dedup keys via trivial collisions"
+    );
+}
+
+#[test]
+fn light_fuzz_dedup_hash_collision_rate_stays_negligible() {
+    let mut rng = StdRng::seed_from_u64(0x9E37_79B9_A1B2_C3D4);
+    let mut seen = HashSet::new();
+    let samples = 8192usize;
+
+    for _ in 0..samples {
+        let user_seed: u64 = rng.random();
+        let peer_seed: u64 = rng.random();
+        let proto = if (peer_seed & 1) == 0 {
+            ProtoTag::Secure
+        } else {
+            ProtoTag::Intermediate
+        };
+        let key = hash_value(&(user_seed, peer_seed, proto, DESYNC_ERROR_CLASS));
+        seen.insert(key);
+    }
+
+    let collisions = samples - seen.len();
+    assert!(
+        collisions <= 1,
+        "light fuzz collision count should remain negligible for 64-bit dedup keys"
+    );
+}
+
+#[test]
+fn stress_desync_dedup_churn_keeps_cache_hard_bounded() {
+    let _guard = desync_dedup_test_lock()
+        .lock()
+        .expect("desync dedup test lock must be available");
+    clear_desync_dedup_for_testing();
+
+    let now = Instant::now();
+    let total = DESYNC_DEDUP_MAX_ENTRIES + 8192;
+
+    for key in 0..total as u64 {
+        let emitted = should_emit_full_desync(key, false, now);
+        if key < DESYNC_DEDUP_MAX_ENTRIES as u64 {
+            assert!(emitted, "keys below cap must be admitted initially");
+        } else {
+            assert!(
+                !emitted,
+                "new keys above cap must stay suppressed under sustained churn"
+            );
+        }
+    }
+
+    let len = DESYNC_DEDUP
+        .get()
+        .expect("dedup cache must be initialized by stress run")
+        .len();
+    assert!(
+        len <= DESYNC_DEDUP_MAX_ENTRIES,
+        "dedup cache must stay bounded under stress churn"
+    );
+}
+
+#[test]
+fn desync_dedup_full_cache_inserts_new_key_with_bounded_single_key_churn() {
+    let _guard = desync_dedup_test_lock()
+        .lock()
+        .expect("desync dedup test lock must be available");
+    clear_desync_dedup_for_testing();
+
+    let dedup = DESYNC_DEDUP.get_or_init(DashMap::new);
+    let base_now = Instant::now();
+
+    // Fill with fresh entries so stale-pruning does not apply.
+    for key in 0..DESYNC_DEDUP_MAX_ENTRIES as u64 {
+        dedup.insert(key, base_now - TokioDuration::from_millis(10));
+    }
+
+    let before_keys: std::collections::HashSet<u64> = dedup.iter().map(|e| *e.key()).collect();
+
+    let newcomer_key = u64::MAX;
+    let emitted = should_emit_full_desync(newcomer_key, false, base_now);
+    assert!(
+        !emitted,
+        "new entry under full fresh cache must stay suppressed"
+    );
+    assert!(
+        dedup.get(&newcomer_key).is_some(),
+        "new key must be inserted after bounded eviction"
+    );
+
+    let after_keys: std::collections::HashSet<u64> = dedup.iter().map(|e| *e.key()).collect();
+    let removed_count = before_keys.difference(&after_keys).count();
+    let added_count = after_keys.difference(&before_keys).count();
+
+    assert_eq!(
+        removed_count, 1,
+        "full-cache insertion must evict exactly one prior key"
+    );
+    assert_eq!(
+        added_count, 1,
+        "full-cache insertion must add exactly one newcomer key"
+    );
+    assert!(
+        dedup.len() <= DESYNC_DEDUP_MAX_ENTRIES,
+        "dedup cache must remain hard-bounded after full-cache churn"
+    );
+}
+
+#[test]
+fn light_fuzz_desync_dedup_temporal_gate_behavior_is_stable() {
+    let _guard = desync_dedup_test_lock()
+        .lock()
+        .expect("desync dedup test lock must be available");
+    clear_desync_dedup_for_testing();
+
+    let key = 0xC0DE_CAFE_u64;
+    let start = Instant::now();
+
+    assert!(
+        should_emit_full_desync(key, false, start),
+        "first event for key must emit full forensic record"
+    );
+
+    // Deterministic pseudo-random time deltas around dedup window edge.
+    let mut s: u64 = 0x1234_5678_9ABC_DEF0;
+    for _ in 0..2048 {
+        s ^= s << 7;
+        s ^= s >> 9;
+        s ^= s << 8;
+
+        let delta_ms = s % (DESYNC_DEDUP_WINDOW.as_millis() as u64 * 2 + 1);
+        let now = start + TokioDuration::from_millis(delta_ms);
+        let emitted = should_emit_full_desync(key, false, now);
+
+        if delta_ms < DESYNC_DEDUP_WINDOW.as_millis() as u64 {
+            assert!(
+                !emitted,
+                "events inside dedup window must remain suppressed"
+            );
+        } else {
+            // Once window elapsed for this key, at least one sample should re-emit and refresh.
+            if emitted {
+                return;
+            }
+        }
+    }
+
+    panic!("expected at least one post-window sample to re-emit forensic record");
 }
 
 fn make_forensics_state() -> RelayForensicsState {
@@ -1010,6 +1196,13 @@ async fn middle_relay_cutover_midflight_releases_route_gauge() {
         relay_result.is_err(),
         "cutover should terminate middle relay session"
     );
+    assert!(
+        matches!(
+            relay_result,
+            Err(ProxyError::Proxy(ref msg)) if msg == ROUTE_SWITCH_ERROR_MSG
+        ),
+        "client-visible cutover error must stay generic and avoid route-internal metadata"
+    );
 
     assert_eq!(
         stats.get_current_connections_me(),
@@ -1018,4 +1211,108 @@ async fn middle_relay_cutover_midflight_releases_route_gauge() {
     );
 
     drop(client_side);
+}
+
+#[tokio::test]
+async fn middle_relay_cutover_storm_multi_session_keeps_generic_errors_and_releases_gauge() {
+    let session_count = 6usize;
+    let stats = Arc::new(Stats::new());
+    let me_pool = make_me_pool_for_abort_test(stats.clone()).await;
+    let config = Arc::new(ProxyConfig::default());
+    let buffer_pool = Arc::new(BufferPool::new());
+    let rng = Arc::new(SecureRandom::new());
+
+    let route_runtime = Arc::new(RouteRuntimeController::new(RelayRouteMode::Middle));
+    let route_snapshot = route_runtime.snapshot();
+
+    let mut relay_tasks = Vec::with_capacity(session_count);
+    let mut client_sides = Vec::with_capacity(session_count);
+
+    for idx in 0..session_count {
+        let (server_side, client_side) = duplex(64 * 1024);
+        client_sides.push(client_side);
+        let (server_reader, server_writer) = tokio::io::split(server_side);
+        let crypto_reader = make_crypto_reader(server_reader);
+        let crypto_writer = make_crypto_writer(server_writer);
+
+        let success = HandshakeSuccess {
+            user: format!("cutover-storm-middle-user-{idx}"),
+            dc_idx: 2,
+            proto_tag: ProtoTag::Intermediate,
+            dec_key: [0u8; 32],
+            dec_iv: 0,
+            enc_key: [0u8; 32],
+            enc_iv: 0,
+            peer: SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+                52000 + idx as u16,
+            ),
+            is_tls: false,
+        };
+
+        relay_tasks.push(tokio::spawn(handle_via_middle_proxy(
+            crypto_reader,
+            crypto_writer,
+            success,
+            me_pool.clone(),
+            stats.clone(),
+            config.clone(),
+            buffer_pool.clone(),
+            "127.0.0.1:443".parse().unwrap(),
+            rng.clone(),
+            route_runtime.subscribe(),
+            route_snapshot,
+            0xB000_0000 + idx as u64,
+        )));
+    }
+
+    tokio::time::timeout(TokioDuration::from_secs(4), async {
+        loop {
+            if stats.get_current_connections_me() == session_count as u64 {
+                break;
+            }
+            tokio::time::sleep(TokioDuration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("all middle sessions must become active before cutover storm");
+
+    let route_runtime_flipper = route_runtime.clone();
+    let flipper = tokio::spawn(async move {
+        for step in 0..64u32 {
+            let mode = if (step & 1) == 0 {
+                RelayRouteMode::Direct
+            } else {
+                RelayRouteMode::Middle
+            };
+            let _ = route_runtime_flipper.set_mode(mode);
+            tokio::time::sleep(TokioDuration::from_millis(15)).await;
+        }
+    });
+
+    for relay_task in relay_tasks {
+        let relay_result = tokio::time::timeout(TokioDuration::from_secs(10), relay_task)
+            .await
+            .expect("middle relay task must finish under cutover storm")
+            .expect("middle relay task must not panic");
+
+        assert!(
+            matches!(
+                relay_result,
+                Err(ProxyError::Proxy(ref msg)) if msg == ROUTE_SWITCH_ERROR_MSG
+            ),
+            "storm-cutover termination must remain generic for all middle sessions"
+        );
+    }
+
+    flipper.abort();
+    let _ = flipper.await;
+
+    assert_eq!(
+        stats.get_current_connections_me(),
+        0,
+        "middle route gauge must return to zero after cutover storm"
+    );
+
+    drop(client_sides);
 }

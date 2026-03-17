@@ -1,6 +1,7 @@
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
@@ -32,6 +33,10 @@ static LOGGED_UNKNOWN_DCS: OnceLock<Mutex<HashSet<i16>>> = OnceLock::new();
 // deterministic under parallel execution.
 fn should_log_unknown_dc(dc_idx: i16) -> bool {
     let set = LOGGED_UNKNOWN_DCS.get_or_init(|| Mutex::new(HashSet::new()));
+    should_log_unknown_dc_with_set(set, dc_idx)
+}
+
+fn should_log_unknown_dc_with_set(set: &Mutex<HashSet<i16>>, dc_idx: i16) -> bool {
     match set.lock() {
         Ok(mut guard) => {
             if guard.contains(&dc_idx) {
@@ -42,10 +47,37 @@ fn should_log_unknown_dc(dc_idx: i16) -> bool {
             }
             guard.insert(dc_idx)
         }
-        // If the lock is poisoned, keep logging rather than silently dropping
-        // operator-visible diagnostics.
-        Err(_) => true,
+        // Fail closed on poisoned state to avoid unbounded blocking log writes.
+        Err(_) => false,
     }
+}
+
+fn sanitize_unknown_dc_log_path(path: &str) -> Option<PathBuf> {
+    let candidate = Path::new(path);
+    if candidate.as_os_str().is_empty() {
+        return None;
+    }
+    if candidate
+        .components()
+        .any(|component| matches!(component, Component::ParentDir))
+    {
+        return None;
+    }
+
+    let cwd = std::env::current_dir().ok()?;
+    let file_name = candidate.file_name()?;
+    let parent = candidate.parent().unwrap_or_else(|| Path::new("."));
+    let parent_path = if parent.is_absolute() {
+        parent.to_path_buf()
+    } else {
+        cwd.join(parent)
+    };
+    let canonical_parent = parent_path.canonicalize().ok()?;
+    if !canonical_parent.is_dir() {
+        return None;
+    }
+
+    Some(canonical_parent.join(file_name))
 }
 
 #[cfg(test)]
@@ -200,12 +232,15 @@ fn get_dc_addr_static(dc_idx: i16, config: &ProxyConfig) -> Result<SocketAddr> {
             && should_log_unknown_dc(dc_idx)
             && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
-            let path = path.clone();
-            handle.spawn_blocking(move || {
-                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
-                    let _ = writeln!(file, "dc_idx={dc_idx}");
-                }
-            });
+            if let Some(path) = sanitize_unknown_dc_log_path(path) {
+                handle.spawn_blocking(move || {
+                    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                        let _ = writeln!(file, "dc_idx={dc_idx}");
+                    }
+                });
+            } else {
+                warn!(dc_idx = dc_idx, raw_path = %path, "Rejected unsafe unknown DC log path");
+            }
         }
     }
 
