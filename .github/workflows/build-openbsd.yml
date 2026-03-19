@@ -30,7 +30,7 @@ jobs:
               echo 'lto = "thin"' >> Cargo.toml
             fi
             
-            export RUSTFLAGS="-C target-cpu=cortex-a53 -C target-feature=+aes,+sha2,+crc -C opt-level=3 -C linker=lld"
+            export RUSTFLAGS="-C target-cpu=cortex-a53 -C target-feature=+aes,+sha2,+crc -C opt-level=3"
             
             cargo build --release
 
