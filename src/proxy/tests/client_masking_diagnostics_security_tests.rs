@@ -95,6 +95,7 @@ async fn capture_forwarded_len(body_sent: usize) -> usize {
     cfg.censorship.mask_unix_sock = None;
     cfg.censorship.mask_host = Some("127.0.0.1".to_string());
     cfg.censorship.mask_port = backend_addr.port();
+    cfg.censorship.mask_shape_hardening = false;
     cfg.timeouts.client_handshake = 1;
 
     let accept_task = tokio::spawn(async move {

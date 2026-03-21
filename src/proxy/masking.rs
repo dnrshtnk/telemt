@@ -31,13 +31,19 @@ const MASK_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const MASK_RELAY_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 const MASK_BUFFER_SIZE: usize = 8192;
 
-async fn copy_with_idle_timeout<R, W>(reader: &mut R, writer: &mut W) -> usize
+struct CopyOutcome {
+    total: usize,
+    ended_by_eof: bool,
+}
+
+async fn copy_with_idle_timeout<R, W>(reader: &mut R, writer: &mut W) -> CopyOutcome
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
     let mut buf = [0u8; MASK_BUFFER_SIZE];
     let mut total = 0usize;
+    let mut ended_by_eof = false;
     loop {
         let read_res = timeout(MASK_RELAY_IDLE_TIMEOUT, reader.read(&mut buf)).await;
         let n = match read_res {
@@ -45,6 +51,7 @@ where
             Ok(Err(_)) | Err(_) => break,
         };
         if n == 0 {
+            ended_by_eof = true;
             break;
         }
         total = total.saturating_add(n);
@@ -55,7 +62,10 @@ where
             Ok(Err(_)) | Err(_) => break,
         }
     }
-    total
+    CopyOutcome {
+        total,
+        ended_by_eof,
+    }
 }
 
 fn next_mask_shape_bucket(total: usize, floor: usize, cap: usize) -> usize {
@@ -443,11 +453,16 @@ where
     let _ = tokio::join!(
         async {
             let copied = copy_with_idle_timeout(&mut reader, &mut mask_write).await;
-            let total_sent = initial_data.len().saturating_add(copied);
+            let total_sent = initial_data.len().saturating_add(copied.total);
+
+            let should_shape = shape_hardening_enabled
+                && copied.ended_by_eof
+                && !initial_data.is_empty();
+
             maybe_write_shape_padding(
                 &mut mask_write,
                 total_sent,
-                shape_hardening_enabled,
+                should_shape,
                 shape_bucket_floor_bytes,
                 shape_bucket_cap_bytes,
                 shape_above_cap_blur,
@@ -496,6 +511,18 @@ mod masking_timing_normalization_security_tests;
 #[cfg(test)]
 #[path = "tests/masking_ab_envelope_blur_integration_security_tests.rs"]
 mod masking_ab_envelope_blur_integration_security_tests;
+
+#[cfg(test)]
+#[path = "tests/masking_shape_guard_security_tests.rs"]
+mod masking_shape_guard_security_tests;
+
+#[cfg(test)]
+#[path = "tests/masking_shape_guard_adversarial_tests.rs"]
+mod masking_shape_guard_adversarial_tests;
+
+#[cfg(test)]
+#[path = "tests/masking_shape_classifier_resistance_adversarial_tests.rs"]
+mod masking_shape_classifier_resistance_adversarial_tests;
 
 #[cfg(test)]
 #[path = "tests/masking_timing_sidechannel_redteam_expected_fail_tests.rs"]

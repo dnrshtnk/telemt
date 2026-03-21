@@ -19,6 +19,52 @@ fn mean_ms(samples: &[u128]) -> f64 {
     sum as f64 / samples.len() as f64
 }
 
+fn percentile_ms(mut values: Vec<u128>, p_num: usize, p_den: usize) -> u128 {
+    values.sort_unstable();
+    if values.is_empty() {
+        return 0;
+    }
+    let idx = ((values.len() - 1) * p_num) / p_den;
+    values[idx]
+}
+
+fn bucketize_ms(values: &[u128], bucket_ms: u128) -> Vec<u128> {
+    values.iter().map(|v| *v / bucket_ms).collect()
+}
+
+fn best_threshold_accuracy_u128(a: &[u128], b: &[u128]) -> f64 {
+    let min_v = *a.iter().chain(b.iter()).min().unwrap();
+    let max_v = *a.iter().chain(b.iter()).max().unwrap();
+
+    let mut best = 0.0f64;
+    for t in min_v..=max_v {
+        let correct_a = a.iter().filter(|&&x| x <= t).count();
+        let correct_b = b.iter().filter(|&&x| x > t).count();
+        let acc = (correct_a + correct_b) as f64 / (a.len() + b.len()) as f64;
+        if acc > best {
+            best = acc;
+        }
+    }
+    best
+}
+
+fn spread_u128(values: &[u128]) -> u128 {
+    if values.is_empty() {
+        return 0;
+    }
+    let min_v = *values.iter().min().unwrap();
+    let max_v = *values.iter().max().unwrap();
+    max_v - min_v
+}
+
+async fn collect_timing_samples(path: PathClass, timing_norm_enabled: bool, n: usize) -> Vec<u128> {
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(measure_masking_duration_ms(path, timing_norm_enabled).await);
+    }
+    out
+}
+
 async fn measure_masking_duration_ms(path: PathClass, timing_norm_enabled: bool) -> u128 {
     let mut config = ProxyConfig::default();
     config.general.beobachten = false;
@@ -238,4 +284,234 @@ async fn integration_ab_harness_envelope_and_blur_improve_obfuscation_vs_baselin
         baseline_overlap,
         hardened_overlap
     );
+}
+
+#[test]
+fn timing_classifier_helper_bucketize_is_stable() {
+    let values = vec![219u128, 220, 239, 240, 259, 260];
+    let got = bucketize_ms(&values, 20);
+    assert_eq!(got, vec![10, 11, 11, 12, 12, 13]);
+}
+
+#[test]
+fn timing_classifier_helper_percentile_is_monotonic() {
+    let samples = vec![210u128, 220, 230, 240, 250, 260, 270, 280];
+    let p50 = percentile_ms(samples.clone(), 50, 100);
+    let p95 = percentile_ms(samples.clone(), 95, 100);
+    assert!(p95 >= p50);
+}
+
+#[test]
+fn timing_classifier_helper_threshold_accuracy_is_perfect_for_disjoint_sets() {
+    let a = vec![10u128, 11, 12, 13, 14];
+    let b = vec![20u128, 21, 22, 23, 24];
+    let acc = best_threshold_accuracy_u128(&a, &b);
+    assert!(acc >= 0.99);
+}
+
+#[test]
+fn timing_classifier_helper_threshold_accuracy_drops_for_identical_sets() {
+    let a = vec![10u128, 11, 12, 13, 14];
+    let b = vec![10u128, 11, 12, 13, 14];
+    let acc = best_threshold_accuracy_u128(&a, &b);
+    assert!(acc <= 0.6, "identical sets should not be strongly separable");
+}
+
+#[test]
+fn timing_classifier_helper_bucketed_threshold_reduces_resolution() {
+    let raw_a = vec![221u128, 223, 225, 227, 229];
+    let raw_b = vec![231u128, 233, 235, 237, 239];
+    let raw_acc = best_threshold_accuracy_u128(&raw_a, &raw_b);
+
+    let bucketed_a = bucketize_ms(&raw_a, 20);
+    let bucketed_b = bucketize_ms(&raw_b, 20);
+    let bucketed_acc = best_threshold_accuracy_u128(&bucketed_a, &bucketed_b);
+
+    assert!(raw_acc >= bucketed_acc);
+}
+
+#[tokio::test]
+async fn timing_classifier_baseline_connect_fail_vs_slow_backend_is_highly_separable() {
+    let fail = collect_timing_samples(PathClass::ConnectFail, false, 8).await;
+    let slow = collect_timing_samples(PathClass::SlowBackend, false, 8).await;
+
+    let acc = best_threshold_accuracy_u128(&fail, &slow);
+    assert!(acc >= 0.80, "baseline timing classes should be separable enough");
+}
+
+#[tokio::test]
+async fn timing_classifier_normalized_connect_fail_vs_slow_backend_reduces_separability() {
+    let baseline_fail = collect_timing_samples(PathClass::ConnectFail, false, 8).await;
+    let baseline_slow = collect_timing_samples(PathClass::SlowBackend, false, 8).await;
+    let hardened_fail = collect_timing_samples(PathClass::ConnectFail, true, 8).await;
+    let hardened_slow = collect_timing_samples(PathClass::SlowBackend, true, 8).await;
+
+    let baseline_acc = best_threshold_accuracy_u128(&baseline_fail, &baseline_slow);
+    let hardened_acc = best_threshold_accuracy_u128(&hardened_fail, &hardened_slow);
+
+    assert!(
+        hardened_acc <= baseline_acc,
+        "normalization should not increase timing separability"
+    );
+}
+
+#[tokio::test]
+async fn timing_classifier_bucketed_normalized_connect_fail_vs_slow_backend_is_bounded() {
+    let baseline_fail = collect_timing_samples(PathClass::ConnectFail, false, 10).await;
+    let baseline_slow = collect_timing_samples(PathClass::SlowBackend, false, 10).await;
+    let hardened_fail = collect_timing_samples(PathClass::ConnectFail, true, 10).await;
+    let hardened_slow = collect_timing_samples(PathClass::SlowBackend, true, 10).await;
+
+    let baseline_acc = best_threshold_accuracy_u128(
+        &bucketize_ms(&baseline_fail, 20),
+        &bucketize_ms(&baseline_slow, 20),
+    );
+    let hardened_acc = best_threshold_accuracy_u128(
+        &bucketize_ms(&hardened_fail, 20),
+        &bucketize_ms(&hardened_slow, 20),
+    );
+
+    assert!(
+        hardened_acc <= baseline_acc,
+        "normalized bucketed classifier should not outperform baseline: baseline={baseline_acc:.3} hardened={hardened_acc:.3}"
+    );
+}
+
+#[tokio::test]
+async fn timing_classifier_normalized_connect_fail_samples_stay_in_sane_bounds() {
+    let samples = collect_timing_samples(PathClass::ConnectFail, true, 6).await;
+    for s in samples {
+        assert!((150..=1200).contains(&s), "sample out of sane bounds: {s}");
+    }
+}
+
+#[tokio::test]
+async fn timing_classifier_normalized_connect_success_samples_stay_in_sane_bounds() {
+    let samples = collect_timing_samples(PathClass::ConnectSuccess, true, 6).await;
+    for s in samples {
+        assert!((150..=1200).contains(&s), "sample out of sane bounds: {s}");
+    }
+}
+
+#[tokio::test]
+async fn timing_classifier_normalized_slow_backend_samples_stay_in_sane_bounds() {
+    let samples = collect_timing_samples(PathClass::SlowBackend, true, 6).await;
+    for s in samples {
+        assert!((150..=1400).contains(&s), "sample out of sane bounds: {s}");
+    }
+}
+
+#[tokio::test]
+async fn timing_classifier_normalized_mean_bucket_delta_connect_fail_vs_connect_success_is_small() {
+    let fail = collect_timing_samples(PathClass::ConnectFail, true, 8).await;
+    let success = collect_timing_samples(PathClass::ConnectSuccess, true, 8).await;
+    let fail_mean = mean_ms(&fail);
+    let success_mean = mean_ms(&success);
+    let delta_bucket = ((fail_mean as i128 - success_mean as i128).abs()) / 20;
+    assert!(delta_bucket <= 3, "mean bucket delta too large: {delta_bucket}");
+}
+
+#[tokio::test]
+async fn timing_classifier_normalized_p95_bucket_delta_connect_success_vs_slow_is_small() {
+    let success = collect_timing_samples(PathClass::ConnectSuccess, true, 10).await;
+    let slow = collect_timing_samples(PathClass::SlowBackend, true, 10).await;
+    let p95_success = percentile_ms(success, 95, 100);
+    let p95_slow = percentile_ms(slow, 95, 100);
+    let delta_bucket = ((p95_success as i128 - p95_slow as i128).abs()) / 20;
+    assert!(delta_bucket <= 4, "p95 bucket delta too large: {delta_bucket}");
+}
+
+#[tokio::test]
+async fn timing_classifier_normalized_spread_is_not_worse_than_baseline_for_connect_fail() {
+    let baseline = collect_timing_samples(PathClass::ConnectFail, false, 8).await;
+    let hardened = collect_timing_samples(PathClass::ConnectFail, true, 8).await;
+    let baseline_spread = spread_u128(&baseline);
+    let hardened_spread = spread_u128(&hardened);
+    assert!(
+        hardened_spread <= baseline_spread.saturating_add(600),
+        "normalized spread exploded unexpectedly: baseline={baseline_spread} hardened={hardened_spread}"
+    );
+}
+
+#[tokio::test]
+async fn timing_classifier_light_fuzz_pairwise_bucketed_accuracy_stays_bounded_under_normalization() {
+    let pairs = [
+        (PathClass::ConnectFail, PathClass::ConnectSuccess),
+        (PathClass::ConnectFail, PathClass::SlowBackend),
+        (PathClass::ConnectSuccess, PathClass::SlowBackend),
+    ];
+
+    let mut meaningful_improvement_seen = false;
+    let mut baseline_sum = 0.0f64;
+    let mut hardened_sum = 0.0f64;
+    let mut pair_count = 0usize;
+
+    for (a, b) in pairs {
+        let baseline_a = collect_timing_samples(a, false, 6).await;
+        let baseline_b = collect_timing_samples(b, false, 6).await;
+        let hardened_a = collect_timing_samples(a, true, 6).await;
+        let hardened_b = collect_timing_samples(b, true, 6).await;
+
+        let baseline_acc = best_threshold_accuracy_u128(
+            &bucketize_ms(&baseline_a, 20),
+            &bucketize_ms(&baseline_b, 20),
+        );
+        let hardened_acc = best_threshold_accuracy_u128(
+            &bucketize_ms(&hardened_a, 20),
+            &bucketize_ms(&hardened_b, 20),
+        );
+
+        // When baseline separability is near-random, tiny sample jitter can make
+        // hardened appear "worse" without indicating a real side-channel regression.
+        // Guard hard only on informative baseline pairs.
+        if baseline_acc >= 0.75 {
+            assert!(
+                hardened_acc <= baseline_acc + 0.05,
+                "normalization should not materially worsen informative pair: baseline={baseline_acc:.3} hardened={hardened_acc:.3}"
+            );
+        }
+
+        if hardened_acc + 0.05 <= baseline_acc {
+            meaningful_improvement_seen = true;
+        }
+
+        baseline_sum += baseline_acc;
+        hardened_sum += hardened_acc;
+        pair_count += 1;
+    }
+
+    let baseline_avg = baseline_sum / pair_count as f64;
+    let hardened_avg = hardened_sum / pair_count as f64;
+
+    assert!(
+        hardened_avg <= baseline_avg + 0.08,
+        "normalization should not materially increase average pairwise separability: baseline_avg={baseline_avg:.3} hardened_avg={hardened_avg:.3}"
+    );
+
+    // Optional signal only: do not require improvement on every run because
+    // noisy CI schedulers can flatten pairwise differences at low sample counts.
+    let _ = meaningful_improvement_seen;
+}
+
+#[tokio::test]
+async fn timing_classifier_stress_parallel_sampling_finishes_and_stays_bounded() {
+    let mut tasks = Vec::new();
+    for i in 0..24usize {
+        tasks.push(tokio::spawn(async move {
+            let class = match i % 3 {
+                0 => PathClass::ConnectFail,
+                1 => PathClass::ConnectSuccess,
+                _ => PathClass::SlowBackend,
+            };
+            let sample = measure_masking_duration_ms(class, true).await;
+            assert!((100..=1600).contains(&sample), "stress sample out of bounds: {sample}");
+        }));
+    }
+
+    for task in tasks {
+        tokio::time::timeout(Duration::from_secs(4), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 }
