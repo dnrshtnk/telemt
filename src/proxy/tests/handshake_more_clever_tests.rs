@@ -1,7 +1,7 @@
 use super::*;
 use crate::crypto::{sha256, sha256_hmac, AesCtr};
 use crate::protocol::constants::{ProtoTag, RESERVED_NONCE_BEGINNINGS, RESERVED_NONCE_FIRST_BYTES};
-use rand::{RngExt, SeedableRng};
+use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};

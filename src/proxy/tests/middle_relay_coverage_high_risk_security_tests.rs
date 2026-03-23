@@ -645,6 +645,75 @@ fn quota_exceeded_boundary_is_inclusive() {
     assert!(!quota_exceeded_for_user(&stats, user, Some(51)));
 }
 
+#[test]
+fn quota_soft_helper_matches_capped_generic_helper_matrix() {
+    let stats = Stats::new();
+    let user = "quota-soft-parity";
+
+    for used in [0u64, 1, 7, 63, 127, 255] {
+        stats.sub_user_octets_to(user, stats.get_user_total_octets(user));
+        stats.add_user_octets_to(user, used);
+
+        for quota in [8u64, 64, 128, 256] {
+            for overshoot in [0u64, 1, 5, 32] {
+                for bytes in [0u64, 1, 2, 7, 31, 64] {
+                    let soft = quota_would_be_exceeded_for_user_soft(
+                        &stats,
+                        user,
+                        Some(quota),
+                        bytes,
+                        overshoot,
+                    );
+                    let capped = quota_would_be_exceeded_for_user(
+                        &stats,
+                        user,
+                        Some(quota_soft_cap(quota, overshoot)),
+                        bytes,
+                    );
+                    assert_eq!(
+                        soft, capped,
+                        "soft helper parity mismatch: used={used} quota={quota} overshoot={overshoot} bytes={bytes}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn quota_soft_helper_none_limit_never_rejects() {
+    let stats = Stats::new();
+    let user = "quota-soft-none";
+    stats.add_user_octets_to(user, u64::MAX);
+
+    assert!(!quota_would_be_exceeded_for_user_soft(
+        &stats,
+        user,
+        None,
+        u64::MAX,
+        u64::MAX,
+    ));
+}
+
+#[test]
+fn quota_soft_cap_saturates_and_stays_fail_closed() {
+    let stats = Stats::new();
+    let user = "quota-soft-saturating";
+    let quota = u64::MAX - 2;
+    let overshoot = 100;
+
+    assert_eq!(quota_soft_cap(quota, overshoot), u64::MAX);
+
+    stats.add_user_octets_to(user, u64::MAX - 1);
+    assert!(quota_would_be_exceeded_for_user_soft(
+        &stats,
+        user,
+        Some(quota),
+        2,
+        overshoot,
+    ));
+}
+
 #[tokio::test]
 async fn enqueue_c2me_close_fast_path_succeeds_without_backpressure() {
     let (tx, mut rx) = mpsc::channel::<C2MeCommand>(4);

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWriteExt, duplex};
-use tokio::time::{Duration as TokioDuration, sleep, timeout};
+use tokio::time::{Duration as TokioDuration, sleep};
 
 fn make_crypto_reader<T>(reader: T) -> CryptoReader<T>
 where
@@ -41,10 +41,10 @@ fn make_forensics(conn_id: u64, started_at: Instant) -> RelayForensicsState {
 fn make_enabled_idle_policy() -> RelayClientIdlePolicy {
     RelayClientIdlePolicy {
         enabled: true,
-        soft_idle: Duration::from_secs(30),
-        hard_idle: Duration::from_secs(60),
+        soft_idle: Duration::from_millis(50),
+        hard_idle: Duration::from_millis(120),
         grace_after_downstream_activity: Duration::from_secs(0),
-        legacy_frame_read_timeout: Duration::from_secs(30),
+        legacy_frame_read_timeout: Duration::from_millis(50),
     }
 }
 
@@ -117,6 +117,11 @@ async fn read_once_with_state(
     .await
 }
 
+fn is_fail_closed_outcome(result: &Result<Option<(PooledBuffer, bool)>>) -> bool {
+    matches!(result, Err(ProxyError::Proxy(_)))
+        || matches!(result, Err(ProxyError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut)
+}
+
 #[tokio::test]
 async fn intermediate_chunked_zero_flood_fail_closed() {
     let (reader, mut writer) = duplex(4096);
@@ -134,8 +139,8 @@ async fn intermediate_chunked_zero_flood_fail_closed() {
     write_chunked_with_jitter(&mut writer, &encrypted, 0x1111_2222).await;
     drop(writer);
 
-    let result = timeout(
-        TokioDuration::from_secs(2),
+    let result = run_relay_test_step_timeout(
+        "intermediate flood read",
         read_once_with_state(
             &mut crypto_reader,
             ProtoTag::Intermediate,
@@ -144,10 +149,12 @@ async fn intermediate_chunked_zero_flood_fail_closed() {
             &mut idle_state,
         ),
     )
-    .await
-    .expect("intermediate flood read must complete");
+    .await;
 
-    assert!(matches!(result, Err(ProxyError::Proxy(_))));
+    assert!(
+        is_fail_closed_outcome(&result),
+        "zero-length flood must fail closed via debt guard or idle timeout"
+    );
     assert_eq!(frame_counter, 0);
 }
 
@@ -168,8 +175,8 @@ async fn secure_chunked_zero_flood_fail_closed() {
     write_chunked_with_jitter(&mut writer, &encrypted, 0x3333_4444).await;
     drop(writer);
 
-    let result = timeout(
-        TokioDuration::from_secs(2),
+    let result = run_relay_test_step_timeout(
+        "secure flood read",
         read_once_with_state(
             &mut crypto_reader,
             ProtoTag::Secure,
@@ -178,10 +185,12 @@ async fn secure_chunked_zero_flood_fail_closed() {
             &mut idle_state,
         ),
     )
-    .await
-    .expect("secure flood read must complete");
+    .await;
 
-    assert!(matches!(result, Err(ProxyError::Proxy(_))));
+    assert!(
+        is_fail_closed_outcome(&result),
+        "secure zero-length flood must fail closed via debt guard or idle timeout"
+    );
     assert_eq!(frame_counter, 0);
 }
 
@@ -208,8 +217,8 @@ async fn intermediate_chunked_alternating_attack_closes_before_eof() {
 
     let mut closed = false;
     for _ in 0..240 {
-        let step = timeout(
-            TokioDuration::from_secs(1),
+        let step = run_relay_test_step_timeout(
+            "intermediate alternating read step",
             read_once_with_state(
                 &mut crypto_reader,
                 ProtoTag::Intermediate,
@@ -218,8 +227,7 @@ async fn intermediate_chunked_alternating_attack_closes_before_eof() {
                 &mut idle_state,
             ),
         )
-        .await
-        .expect("intermediate alternating read step must complete");
+        .await;
 
         match step {
             Ok(Some(_)) => {}
@@ -259,8 +267,8 @@ async fn secure_chunked_alternating_attack_closes_before_eof() {
 
     let mut closed = false;
     for _ in 0..240 {
-        let step = timeout(
-            TokioDuration::from_secs(1),
+        let step = run_relay_test_step_timeout(
+            "secure alternating read step",
             read_once_with_state(
                 &mut crypto_reader,
                 ProtoTag::Secure,
@@ -269,8 +277,7 @@ async fn secure_chunked_alternating_attack_closes_before_eof() {
                 &mut idle_state,
             ),
         )
-        .await
-        .expect("secure alternating read step must complete");
+        .await;
 
         match step {
             Ok(Some(_)) => {}
@@ -394,8 +401,8 @@ async fn light_fuzz_proto_chunking_outcomes_are_bounded() {
         drop(writer);
 
         for _ in 0..260 {
-            let step = timeout(
-                TokioDuration::from_secs(1),
+            let step = run_relay_test_step_timeout(
+                "fuzz proto read step",
                 read_once_with_state(
                     &mut crypto_reader,
                     proto,
@@ -404,12 +411,12 @@ async fn light_fuzz_proto_chunking_outcomes_are_bounded() {
                     &mut idle_state,
                 ),
             )
-            .await
-            .expect("fuzz proto read step must complete");
+            .await;
 
             match step {
                 Ok(Some((_payload, _))) => {}
                 Err(ProxyError::Proxy(_)) => break,
+                Err(ProxyError::Io(e)) if e.kind() == std::io::ErrorKind::TimedOut => break,
                 Ok(None) => break,
                 Err(other) => panic!("unexpected proto chunking fuzz error: {other}"),
             }

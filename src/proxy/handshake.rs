@@ -131,8 +131,7 @@ fn auth_probe_scan_start_offset(
         return 0;
     }
 
-    let window = state_len.min(scan_limit);
-    auth_probe_eviction_offset(peer_ip, now) % window
+    auth_probe_eviction_offset(peer_ip, now) % state_len
 }
 
 fn auth_probe_is_throttled(peer_ip: IpAddr, now: Instant) -> bool {
@@ -996,6 +995,10 @@ mod auth_probe_scan_budget_security_tests;
 #[cfg(test)]
 #[path = "tests/handshake_auth_probe_scan_offset_stress_tests.rs"]
 mod auth_probe_scan_offset_stress_tests;
+
+#[cfg(test)]
+#[path = "tests/handshake_auth_probe_eviction_bias_security_tests.rs"]
+mod auth_probe_eviction_bias_security_tests;
 
 #[cfg(test)]
 #[path = "tests/handshake_advanced_clever_tests.rs"]

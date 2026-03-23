@@ -22,12 +22,13 @@ fn edge_zero_state_len_yields_zero_start_offset() {
 }
 
 #[test]
-fn adversarial_large_state_must_bound_start_offset_to_scan_budget() {
+fn adversarial_large_state_must_allow_start_offset_outside_scan_budget_window() {
     let _guard = auth_probe_test_guard();
     let base = Instant::now();
     let scan_limit = 16usize;
     let state_len = 65_536usize;
 
+    let mut saw_offset_outside_window = false;
     for i in 0..2048u32 {
         let ip = IpAddr::V4(Ipv4Addr::new(
             203,
@@ -38,10 +39,19 @@ fn adversarial_large_state_must_bound_start_offset_to_scan_budget() {
         let now = base + Duration::from_micros(i as u64);
         let start = auth_probe_scan_start_offset(ip, now, state_len, scan_limit);
         assert!(
-            start < scan_limit,
-            "start offset must stay within scan window; start={start}, limit={scan_limit}"
+            start < state_len,
+            "start offset must stay within state length; start={start}, len={state_len}"
         );
+        if start >= scan_limit {
+            saw_offset_outside_window = true;
+            break;
+        }
     }
+
+    assert!(
+        saw_offset_outside_window,
+        "large-state eviction must sample beyond the first scan window"
+    );
 }
 
 #[test]
@@ -80,11 +90,10 @@ fn light_fuzz_scan_offset_budget_never_exceeds_effective_window() {
         let scan_limit = ((seed >> 32) as usize % 512).saturating_add(1);
         let now = base + Duration::from_nanos(seed & 0xffff);
         let start = auth_probe_scan_start_offset(ip, now, state_len, scan_limit);
-        let effective_window = state_len.min(scan_limit);
 
         assert!(
-            start < effective_window,
-            "scan offset must stay inside effective window"
+            start < state_len,
+            "scan offset must stay inside state length"
         );
     }
 }

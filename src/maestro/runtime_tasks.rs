@@ -32,6 +32,14 @@ pub(crate) struct RuntimeWatches {
     pub(crate) detected_ip_v6: Option<IpAddr>,
 }
 
+const QUOTA_USER_LOCK_EVICT_INTERVAL_SECS: u64 = 60;
+
+fn spawn_quota_lock_maintenance_task() -> tokio::task::JoinHandle<()> {
+    crate::proxy::relay::spawn_quota_user_lock_evictor(std::time::Duration::from_secs(
+        QUOTA_USER_LOCK_EVICT_INTERVAL_SECS,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn spawn_runtime_tasks(
     config: &Arc<ProxyConfig>,
@@ -68,6 +76,8 @@ pub(crate) async fn spawn_runtime_tasks(
     tokio::spawn(async move {
         rc_clone.run_periodic_cleanup().await;
     });
+
+    spawn_quota_lock_maintenance_task();
 
     let detected_ip_v4: Option<IpAddr> = probe.detected_ipv4.map(IpAddr::V4);
     let detected_ip_v6: Option<IpAddr> = probe.detected_ipv6.map(IpAddr::V6);
@@ -359,4 +369,25 @@ pub(crate) async fn mark_runtime_ready(startup_tracker: &Arc<StartupTracker>) {
         )
         .await;
     startup_tracker.mark_ready().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tdd_runtime_quota_lock_maintenance_path_spawns_single_evictor_task() {
+        crate::proxy::relay::reset_quota_user_lock_evictor_spawn_count_for_tests();
+
+        let handle = spawn_quota_lock_maintenance_task();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        assert_eq!(
+            crate::proxy::relay::quota_user_lock_evictor_spawn_count_for_tests(),
+            1,
+            "runtime maintenance path must spawn exactly one quota lock evictor task per call"
+        );
+
+        handle.abort();
+    }
 }

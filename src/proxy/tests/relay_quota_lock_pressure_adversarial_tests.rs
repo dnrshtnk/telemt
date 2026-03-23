@@ -127,7 +127,7 @@ fn quota_lock_saturation_returns_stable_overflow_lock_without_cache_growth() {
 }
 
 #[test]
-fn quota_lock_reclaims_unreferenced_entries_before_ephemeral_fallback() {
+fn quota_lock_reclaims_unreferenced_entries_after_explicit_eviction_pass() {
     let _guard = super::quota_user_lock_test_scope();
     let map = QUOTA_USER_LOCKS.get_or_init(DashMap::new);
     map.clear();
@@ -141,6 +141,8 @@ fn quota_lock_reclaims_unreferenced_entries_before_ephemeral_fallback() {
     }
 
     drop(retained);
+
+    quota_user_lock_evict();
 
     let overflow_user = format!("quota-reclaim-overflow-{}", std::process::id());
     let overflow = quota_user_lock(&overflow_user);

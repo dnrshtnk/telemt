@@ -22,10 +22,10 @@ fn positive_same_ip_moving_time_yields_diverse_scan_offsets() {
         uniq.insert(offset);
     }
 
-    assert_eq!(
-        uniq.len(),
-        16,
-        "offset randomization must cover the entire scan window over 512 samples"
+    assert!(
+        uniq.len() >= 256,
+        "offset randomization collapsed unexpectedly for same-ip moving-time samples (uniq={})",
+        uniq.len()
     );
 }
 
@@ -45,10 +45,10 @@ fn adversarial_many_ips_same_time_spreads_offsets_without_bias_collapse() {
         uniq.insert(auth_probe_scan_start_offset(ip, now, 65_536, 16));
     }
 
-    assert_eq!(
-        uniq.len(),
-        16,
-        "scan offset distribution collapsed unexpectedly across peer set"
+    assert!(
+        uniq.len() >= 512,
+        "scan offset distribution collapsed unexpectedly across adversarial peer set (uniq={})",
+        uniq.len()
     );
 }
 
@@ -108,6 +108,9 @@ fn light_fuzz_scan_offset_stays_within_window_for_randomized_inputs() {
         let now = base + Duration::from_nanos(seed & 0x1fff);
 
         let offset = auth_probe_scan_start_offset(ip, now, state_len, scan_limit);
-        assert!(offset < state_len.min(scan_limit));
+        assert!(
+            offset < state_len,
+            "scan offset must always remain inside state length"
+        );
     }
 }

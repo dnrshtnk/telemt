@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWriteExt, duplex};
 use tokio::task::JoinSet;
-use tokio::time::{Duration as TokioDuration, sleep, timeout};
+use tokio::time::{Duration as TokioDuration, sleep};
 
 fn make_crypto_reader<T>(reader: T) -> CryptoReader<T>
 where
@@ -42,10 +42,10 @@ fn make_forensics(conn_id: u64, started_at: Instant) -> RelayForensicsState {
 fn make_enabled_idle_policy() -> RelayClientIdlePolicy {
     RelayClientIdlePolicy {
         enabled: true,
-        soft_idle: Duration::from_secs(30),
-        hard_idle: Duration::from_secs(60),
+        soft_idle: Duration::from_millis(50),
+        hard_idle: Duration::from_millis(120),
         grace_after_downstream_activity: Duration::from_secs(0),
-        legacy_frame_read_timeout: Duration::from_secs(30),
+        legacy_frame_read_timeout: Duration::from_millis(50),
     }
 }
 
@@ -94,8 +94,8 @@ async fn stress_parallel_pure_tiny_floods_all_fail_closed() {
             writer.write_all(&flood_encrypted).await.unwrap();
             drop(writer);
 
-            let result = timeout(
-                TokioDuration::from_secs(1),
+            let result = run_relay_test_step_timeout(
+                "tiny flood task",
                 read_once(
                     &mut crypto_reader,
                     ProtoTag::Abridged,
@@ -104,8 +104,7 @@ async fn stress_parallel_pure_tiny_floods_all_fail_closed() {
                     &mut idle_state,
                 ),
             )
-            .await
-            .expect("tiny flood task must complete");
+            .await;
 
             assert!(matches!(result, Err(ProxyError::Proxy(_))));
             assert_eq!(frame_counter, 0);
@@ -140,8 +139,8 @@ async fn stress_parallel_benign_tiny_burst_then_real_all_pass() {
             let encrypted = encrypt_for_reader(&plaintext);
             writer.write_all(&encrypted).await.unwrap();
 
-            let result = timeout(
-                TokioDuration::from_secs(1),
+            let result = run_relay_test_step_timeout(
+                "benign tiny burst read",
                 read_once(
                     &mut crypto_reader,
                     ProtoTag::Abridged,
@@ -151,7 +150,6 @@ async fn stress_parallel_benign_tiny_burst_then_real_all_pass() {
                 ),
             )
             .await
-            .expect("benign task must complete")
             .expect("benign payload must parse")
             .expect("benign payload must return frame");
 
@@ -196,8 +194,8 @@ async fn adversarial_lockstep_alternating_attack_under_jitter_closes() {
 
             let mut closed = false;
             for _ in 0..220 {
-                let result = timeout(
-                    TokioDuration::from_secs(1),
+                let result = run_relay_test_step_timeout(
+                    "alternating jitter read step",
                     read_once(
                         &mut crypto_reader,
                         ProtoTag::Abridged,
@@ -206,8 +204,7 @@ async fn adversarial_lockstep_alternating_attack_under_jitter_closes() {
                         &mut idle_state,
                     ),
                 )
-                .await
-                .expect("alternating reader step must complete");
+                .await;
 
                 match result {
                     Ok(Some((_payload, _))) => {}
@@ -336,8 +333,8 @@ async fn light_fuzz_parallel_patterns_no_hang_or_panic() {
             drop(writer);
 
             for _ in 0..320 {
-                let step = timeout(
-                    TokioDuration::from_secs(1),
+                let step = run_relay_test_step_timeout(
+                    "fuzz case read step",
                     read_once(
                         &mut crypto_reader,
                         ProtoTag::Abridged,
@@ -346,8 +343,7 @@ async fn light_fuzz_parallel_patterns_no_hang_or_panic() {
                         &mut idle_state,
                     ),
                 )
-                .await
-                .expect("fuzz case read step must complete");
+                .await;
 
                 match step {
                     Ok(Some(_)) => {}

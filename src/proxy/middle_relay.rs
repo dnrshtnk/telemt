@@ -1,5 +1,7 @@
 use std::collections::hash_map::RandomState;
 use std::collections::{BTreeSet, HashMap};
+#[cfg(test)]
+use std::future::Future;
 use std::hash::{BuildHasher, Hash};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -45,6 +47,8 @@ const TINY_FRAME_DEBT_LIMIT: u32 = 512;
 const C2ME_SEND_TIMEOUT: Duration = Duration::from_millis(50);
 #[cfg(not(test))]
 const C2ME_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const RELAY_TEST_STEP_TIMEOUT: Duration = Duration::from_secs(1);
 const ME_D2C_FLUSH_BATCH_MAX_FRAMES_MIN: usize = 1;
 const ME_D2C_FLUSH_BATCH_MAX_BYTES_MIN: usize = 4096;
 const ME_D2C_FRAME_BUF_SHRINK_HYSTERESIS_FACTOR: usize = 2;
@@ -561,11 +565,8 @@ fn quota_would_be_exceeded_for_user_soft(
     bytes: u64,
     overshoot: u64,
 ) -> bool {
-    quota_limit.is_some_and(|quota| {
-        let cap = quota_soft_cap(quota, overshoot);
-        let used = stats.get_user_total_octets(user);
-        used >= cap || bytes > cap.saturating_sub(used)
-    })
+    let capped_limit = quota_limit.map(|quota| quota_soft_cap(quota, overshoot));
+    quota_would_be_exceeded_for_user(stats, user, capped_limit, bytes)
 }
 
 fn classify_me_d2c_flush_reason(
@@ -683,7 +684,7 @@ fn quota_user_lock(user: &str) -> Arc<AsyncMutex<()>> {
 }
 
 #[cfg(test)]
-pub(crate) fn cross_mode_quota_user_lock_for_tests(user: &str) -> Arc<Mutex<()>> {
+pub(crate) fn cross_mode_quota_user_lock_for_tests(user: &str) -> Arc<AsyncMutex<()>> {
     crate::proxy::quota_lock_registry::cross_mode_quota_user_lock(user)
 }
 
@@ -710,6 +711,16 @@ async fn enqueue_c2me_command(
             }
         }
     }
+}
+
+#[cfg(test)]
+async fn run_relay_test_step_timeout<F, T>(context: &'static str, fut: F) -> T
+where
+    F: Future<Output = T>,
+{
+    timeout(RELAY_TEST_STEP_TIMEOUT, fut)
+        .await
+        .unwrap_or_else(|_| panic!("{context} exceeded {}s", RELAY_TEST_STEP_TIMEOUT.as_secs()))
 }
 
 pub(crate) async fn handle_via_middle_proxy<R, W>(
@@ -860,6 +871,7 @@ where
     let stats_clone = stats.clone();
     let rng_clone = rng.clone();
     let user_clone = user.clone();
+    let cross_mode_quota_lock_me_writer = cross_mode_quota_lock.clone();
     let last_downstream_activity_ms_clone = last_downstream_activity_ms.clone();
     let bytes_me2c_clone = bytes_me2c.clone();
     let d2c_flush_policy = MeD2cFlushPolicy::from_config(&config);
@@ -881,7 +893,7 @@ where
 
                     let first_is_downstream_activity =
                         matches!(&first, MeResponse::Data { .. } | MeResponse::Ack(_));
-                    match process_me_writer_response(
+                    match process_me_writer_response_with_cross_mode_lock(
                         first,
                         &mut writer,
                         proto_tag,
@@ -891,6 +903,7 @@ where
                         &user_clone,
                         quota_limit,
                         d2c_flush_policy.quota_soft_overshoot_bytes,
+                        cross_mode_quota_lock_me_writer.as_ref(),
                         bytes_me2c_clone.as_ref(),
                         conn_id,
                         d2c_flush_policy.ack_flush_immediate,
@@ -939,7 +952,7 @@ where
 
                         let next_is_downstream_activity =
                             matches!(&next, MeResponse::Data { .. } | MeResponse::Ack(_));
-                        match process_me_writer_response(
+                        match process_me_writer_response_with_cross_mode_lock(
                             next,
                             &mut writer,
                             proto_tag,
@@ -949,6 +962,7 @@ where
                             &user_clone,
                             quota_limit,
                             d2c_flush_policy.quota_soft_overshoot_bytes,
+                            cross_mode_quota_lock_me_writer.as_ref(),
                             bytes_me2c_clone.as_ref(),
                             conn_id,
                             d2c_flush_policy.ack_flush_immediate,
@@ -1000,7 +1014,7 @@ where
                             Ok(Some(next)) => {
                                 let next_is_downstream_activity =
                                     matches!(&next, MeResponse::Data { .. } | MeResponse::Ack(_));
-                                match process_me_writer_response(
+                                match process_me_writer_response_with_cross_mode_lock(
                                     next,
                                     &mut writer,
                                     proto_tag,
@@ -1010,6 +1024,7 @@ where
                                     &user_clone,
                                     quota_limit,
                                     d2c_flush_policy.quota_soft_overshoot_bytes,
+                                    cross_mode_quota_lock_me_writer.as_ref(),
                                     bytes_me2c_clone.as_ref(),
                                     conn_id,
                                     d2c_flush_policy.ack_flush_immediate,
@@ -1063,7 +1078,7 @@ where
 
                                     let extra_is_downstream_activity =
                                         matches!(&extra, MeResponse::Data { .. } | MeResponse::Ack(_));
-                                    match process_me_writer_response(
+                                    match process_me_writer_response_with_cross_mode_lock(
                                         extra,
                                         &mut writer,
                                         proto_tag,
@@ -1073,6 +1088,7 @@ where
                                         &user_clone,
                                         quota_limit,
                                         d2c_flush_policy.quota_soft_overshoot_bytes,
+                                        cross_mode_quota_lock_me_writer.as_ref(),
                                         bytes_me2c_clone.as_ref(),
                                         conn_id,
                                         d2c_flush_policy.ack_flush_immediate,
@@ -1252,10 +1268,7 @@ where
                                 ));
                                 break;
                             };
-                            let _cross_mode_quota_guard = match cross_mode_lock.lock() {
-                                Ok(guard) => guard,
-                                Err(poisoned) => poisoned.into_inner(),
-                            };
+                            let _cross_mode_quota_guard = cross_mode_lock.lock().await;
                             stats.add_user_octets_from(&user, payload.len() as u64);
                             if quota_exceeded_for_user(stats.as_ref(), &user, Some(limit)) {
                                 main_result = Err(ProxyError::DataQuotaExceeded {
@@ -1741,6 +1754,7 @@ enum MeWriterResponseOutcome {
     Close,
 }
 
+#[cfg(test)]
 async fn process_me_writer_response<W>(
     response: MeResponse,
     client_writer: &mut CryptoWriter<W>,
@@ -1759,6 +1773,44 @@ async fn process_me_writer_response<W>(
 where
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    process_me_writer_response_with_cross_mode_lock(
+        response,
+        client_writer,
+        proto_tag,
+        rng,
+        frame_buf,
+        stats,
+        user,
+        quota_limit,
+        quota_soft_overshoot_bytes,
+        None,
+        bytes_me2c,
+        conn_id,
+        ack_flush_immediate,
+        batched,
+    )
+    .await
+}
+
+async fn process_me_writer_response_with_cross_mode_lock<W>(
+    response: MeResponse,
+    client_writer: &mut CryptoWriter<W>,
+    proto_tag: ProtoTag,
+    rng: &SecureRandom,
+    frame_buf: &mut Vec<u8>,
+    stats: &Stats,
+    user: &str,
+    quota_limit: Option<u64>,
+    quota_soft_overshoot_bytes: u64,
+    cross_mode_quota_lock: Option<&Arc<AsyncMutex<()>>>,
+    bytes_me2c: &AtomicU64,
+    conn_id: u64,
+    ack_flush_immediate: bool,
+    batched: bool,
+) -> Result<MeWriterResponseOutcome>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     match response {
         MeResponse::Data { flags, data } => {
             if batched {
@@ -1768,8 +1820,23 @@ where
             }
             let data_len = data.len() as u64;
             if let Some(limit) = quota_limit {
+                let owned_cross_mode_lock;
+                let cross_mode_lock = if let Some(lock) = cross_mode_quota_lock {
+                    lock
+                } else {
+                    owned_cross_mode_lock =
+                        crate::proxy::quota_lock_registry::cross_mode_quota_user_lock(user);
+                    &owned_cross_mode_lock
+                };
+                let cross_mode_quota_guard = cross_mode_lock.lock().await;
                 let soft_limit = quota_soft_cap(limit, quota_soft_overshoot_bytes);
-                if quota_would_be_exceeded_for_user(stats, user, Some(soft_limit), data_len) {
+                if quota_would_be_exceeded_for_user_soft(
+                    stats,
+                    user,
+                    Some(limit),
+                    data_len,
+                    quota_soft_overshoot_bytes,
+                ) {
                     stats.increment_me_d2c_quota_reject_total(MeD2cQuotaRejectStage::PreWrite);
                     return Err(ProxyError::DataQuotaExceeded {
                         user: user.to_string(),
@@ -1788,6 +1855,10 @@ where
                         user: user.to_string(),
                     });
                 }
+
+                // Keep cross-mode lock scope explicit and minimal: quota reservation is serialized,
+                // but socket I/O proceeds without holding same-user cross-mode admission lock.
+                drop(cross_mode_quota_guard);
 
                 let write_mode =
                     match write_client_payload(client_writer, proto_tag, flags, &data, rng, frame_buf)
@@ -2084,3 +2155,27 @@ mod middle_relay_tiny_frame_debt_concurrency_security_tests;
 #[cfg(test)]
 #[path = "tests/middle_relay_tiny_frame_debt_proto_chunking_security_tests.rs"]
 mod middle_relay_tiny_frame_debt_proto_chunking_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_cross_mode_quota_reservation_security_tests.rs"]
+mod middle_relay_cross_mode_quota_reservation_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_cross_mode_quota_lock_matrix_security_tests.rs"]
+mod middle_relay_cross_mode_quota_lock_matrix_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_cross_mode_lookup_efficiency_security_tests.rs"]
+mod middle_relay_cross_mode_lookup_efficiency_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_cross_mode_lock_release_regression_security_tests.rs"]
+mod middle_relay_cross_mode_lock_release_regression_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_quota_extended_attack_surface_security_tests.rs"]
+mod middle_relay_quota_extended_attack_surface_security_tests;
+
+#[cfg(test)]
+#[path = "tests/middle_relay_quota_reservation_extreme_security_tests.rs"]
+mod middle_relay_quota_reservation_extreme_security_tests;

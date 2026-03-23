@@ -19,6 +19,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
+#[cfg(unix)]
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::{Instant, timeout};
 use tracing::debug;
 
@@ -94,10 +96,6 @@ where
         match write_res {
             Ok(Ok(())) => {}
             Ok(Err(_)) | Err(_) => break,
-        }
-
-        if total >= byte_cap {
-            break;
         }
     }
     CopyOutcome {
@@ -370,6 +368,9 @@ struct LocalInterfaceCache {
 static LOCAL_INTERFACE_CACHE: OnceLock<Mutex<LocalInterfaceCache>> = OnceLock::new();
 
 #[cfg(unix)]
+static LOCAL_INTERFACE_REFRESH_LOCK: OnceLock<AsyncMutex<()>> = OnceLock::new();
+
+#[cfg(all(unix, test))]
 fn local_interface_ips() -> Vec<IpAddr> {
     let cache = LOCAL_INTERFACE_CACHE.get_or_init(|| Mutex::new(LocalInterfaceCache::default()));
     let mut guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
@@ -386,8 +387,56 @@ fn local_interface_ips() -> Vec<IpAddr> {
     guard.ips.clone()
 }
 
-#[cfg(not(unix))]
+#[cfg(unix)]
+async fn local_interface_ips_async() -> Vec<IpAddr> {
+    let cache = LOCAL_INTERFACE_CACHE.get_or_init(|| Mutex::new(LocalInterfaceCache::default()));
+
+    {
+        let guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+        let stale = guard
+            .refreshed_at
+            .is_none_or(|at| at.elapsed() >= LOCAL_INTERFACE_CACHE_TTL);
+        if !stale {
+            return guard.ips.clone();
+        }
+    }
+
+    let refresh_lock = LOCAL_INTERFACE_REFRESH_LOCK.get_or_init(|| AsyncMutex::new(()));
+    let _refresh_guard = refresh_lock.lock().await;
+
+    {
+        let guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+        let stale = guard
+            .refreshed_at
+            .is_none_or(|at| at.elapsed() >= LOCAL_INTERFACE_CACHE_TTL);
+        if !stale {
+            return guard.ips.clone();
+        }
+    }
+
+    let refreshed = tokio::task::spawn_blocking(collect_local_interface_ips)
+        .await
+        .unwrap_or_default();
+
+    let mut guard = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+    let stale = guard
+        .refreshed_at
+        .is_none_or(|at| at.elapsed() >= LOCAL_INTERFACE_CACHE_TTL);
+    if stale {
+        guard.ips = choose_interface_snapshot(&guard.ips, refreshed);
+        guard.refreshed_at = Some(StdInstant::now());
+    }
+
+    guard.ips.clone()
+}
+
+#[cfg(all(not(unix), test))]
 fn local_interface_ips() -> Vec<IpAddr> {
+    Vec::new()
+}
+
+#[cfg(not(unix))]
+async fn local_interface_ips_async() -> Vec<IpAddr> {
     Vec::new()
 }
 
@@ -457,6 +506,7 @@ fn is_mask_target_local_listener_with_interfaces(
     false
 }
 
+#[cfg(test)]
 fn is_mask_target_local_listener(
     mask_host: &str,
     mask_port: u16,
@@ -468,6 +518,26 @@ fn is_mask_target_local_listener(
     }
 
     let interfaces = local_interface_ips();
+    is_mask_target_local_listener_with_interfaces(
+        mask_host,
+        mask_port,
+        local_addr,
+        resolved_override,
+        &interfaces,
+    )
+}
+
+async fn is_mask_target_local_listener_async(
+    mask_host: &str,
+    mask_port: u16,
+    local_addr: SocketAddr,
+    resolved_override: Option<SocketAddr>,
+) -> bool {
+    if mask_port != local_addr.port() {
+        return false;
+    }
+
+    let interfaces = local_interface_ips_async().await;
     is_mask_target_local_listener_with_interfaces(
         mask_host,
         mask_port,
@@ -608,13 +678,15 @@ pub async fn handle_bad_client<R, W>(
         .as_deref()
         .unwrap_or(&config.censorship.tls_domain);
     let mask_port = config.censorship.mask_port;
-    let outcome_started = Instant::now();
 
     // Fail closed when fallback points at our own listener endpoint.
     // Self-referential masking can create recursive proxy loops under
     // misconfiguration and leak distinguishable load spikes to adversaries.
     let resolved_mask_addr = resolve_socket_addr(mask_host, mask_port);
-    if is_mask_target_local_listener(mask_host, mask_port, local_addr, resolved_mask_addr) {
+    if is_mask_target_local_listener_async(mask_host, mask_port, local_addr, resolved_mask_addr)
+        .await
+    {
+        let outcome_started = Instant::now();
         debug!(
             client_type = client_type,
             host = %mask_host,
@@ -626,6 +698,8 @@ pub async fn handle_bad_client<R, W>(
         wait_mask_outcome_budget(outcome_started, config).await;
         return;
     }
+
+    let outcome_started = Instant::now();
 
     debug!(
         client_type = client_type,
@@ -768,7 +842,13 @@ async fn consume_client_data<R: AsyncRead + Unpin>(mut reader: R, byte_cap: usiz
     let mut total = 0usize;
 
     loop {
-        let n = match timeout(MASK_RELAY_IDLE_TIMEOUT, reader.read(&mut buf)).await {
+        let remaining_budget = byte_cap.saturating_sub(total);
+        if remaining_budget == 0 {
+            break;
+        }
+
+        let read_len = remaining_budget.min(MASK_BUFFER_SIZE);
+        let n = match timeout(MASK_RELAY_IDLE_TIMEOUT, reader.read(&mut buf[..read_len])).await {
             Ok(Ok(n)) => n,
             Ok(Err(_)) | Err(_) => break,
         };
@@ -803,6 +883,10 @@ mod masking_shape_above_cap_blur_security_tests;
 #[cfg(test)]
 #[path = "tests/masking_timing_normalization_security_tests.rs"]
 mod masking_timing_normalization_security_tests;
+
+#[cfg(test)]
+#[path = "tests/masking_timing_budget_coupling_security_tests.rs"]
+mod masking_timing_budget_coupling_security_tests;
 
 #[cfg(test)]
 #[path = "tests/masking_ab_envelope_blur_integration_security_tests.rs"]
@@ -883,6 +967,18 @@ mod masking_interface_cache_security_tests;
 #[cfg(test)]
 #[path = "tests/masking_interface_cache_defense_in_depth_security_tests.rs"]
 mod masking_interface_cache_defense_in_depth_security_tests;
+
+#[cfg(test)]
+#[path = "tests/masking_interface_cache_concurrency_security_tests.rs"]
+mod masking_interface_cache_concurrency_security_tests;
+
+#[cfg(test)]
+#[path = "tests/masking_production_cap_regression_security_tests.rs"]
+mod masking_production_cap_regression_security_tests;
+
+#[cfg(test)]
+#[path = "tests/masking_extended_attack_surface_security_tests.rs"]
+mod masking_extended_attack_surface_security_tests;
 
 #[cfg(test)]
 #[path = "tests/masking_padding_timeout_adversarial_tests.rs"]
