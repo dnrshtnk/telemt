@@ -234,7 +234,10 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
     let me_allows_normal = telemetry.me_level.allows_normal();
     let me_allows_debug = telemetry.me_level.allows_debug();
 
-    let _ = writeln!(out, "# HELP telemt_build_info Build information for the running telemt binary");
+    let _ = writeln!(
+        out,
+        "# HELP telemt_build_info Build information for the running telemt binary"
+    );
     let _ = writeln!(out, "# TYPE telemt_build_info gauge");
     let _ = writeln!(
         out,
@@ -2835,10 +2838,14 @@ mod tests {
                 .unwrap()
                 .contains("telemt_connections_total 3")
         );
-        assert!(std::str::from_utf8(body.as_ref()).unwrap().contains(&format!(
-            "telemt_build_info{{version=\"{}\"}} 1",
-            env!("CARGO_PKG_VERSION")
-        )));
+        assert!(
+            std::str::from_utf8(body.as_ref())
+                .unwrap()
+                .contains(&format!(
+                    "telemt_build_info{{version=\"{}\"}} 1",
+                    env!("CARGO_PKG_VERSION")
+                ))
+        );
 
         config.general.beobachten = true;
         config.general.beobachten_minutes = 10;
